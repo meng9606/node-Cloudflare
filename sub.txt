@@ -1,0 +1,1416 @@
+/**
+ * Sub Aggregator - Cloudflare Worker
+ * 聚合订阅生成器：支持单节点(vless/vmess/trojan/ss/hysteria2) + 远程订阅源实时聚合
+ * 自动识别 Clash/OpenClash 与 Shadowrocket/V2ray 等客户端，分别输出 YAML / Base64
+ * 数据存储：Cloudflare KV
+ *
+ * 本版本新增：
+ * 1. 已保存节点支持二次修改（编辑节点链接/名称）
+ * 2. Clash 输出内置防 DNS 泄漏规则集（参考 ACL4SSR nodnsleak 规则）
+ */
+
+// ============================== 工具函数 ==============================
+
+function b64EncodeUtf8(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  bytes.forEach((b) => (bin += String.fromCharCode(b)));
+  return btoa(bin);
+}
+
+function b64DecodeUtf8(str) {
+  const bin = atob(fixB64(str));
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+function fixB64(s) {
+  s = String(s).trim().replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  return s;
+}
+
+function looksLikeBase64(s) {
+  const t = s.trim();
+  if (t.length < 8) return false;
+  return /^[A-Za-z0-9+/_-]+={0,2}$/.test(t.replace(/\s/g, ''));
+}
+
+function splitFirst(s, sep) {
+  const i = s.indexOf(sep);
+  if (i < 0) return [s, ''];
+  return [s.slice(0, i), s.slice(i + 1)];
+}
+
+function splitLast(s, sep) {
+  const i = s.lastIndexOf(sep);
+  if (i < 0) return [s, ''];
+  return [s.slice(0, i), s.slice(i + 1)];
+}
+
+function uid(len = 12) {
+  const bytes = crypto.getRandomValues(new Uint8Array(len));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('').slice(0, len);
+}
+
+function randomToken(len = 28) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes = crypto.getRandomValues(new Uint8Array(len));
+  return Array.from(bytes, (b) => chars[b % chars.length]).join('');
+}
+
+async function sha256Hex(str) {
+  const data = new TextEncoder().encode(str);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function jsonResponse(obj, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', ...extraHeaders },
+  });
+}
+
+function parseCookies(req) {
+  const header = req.headers.get('Cookie') || '';
+  const out = {};
+  header.split(';').forEach((p) => {
+    const [k, ...v] = p.trim().split('=');
+    if (!k) return;
+    out[k] = decodeURIComponent(v.join('='));
+  });
+  return out;
+}
+
+// ============================== YAML 序列化（受控子集） ==============================
+
+function yamlScalar(v) {
+  if (v === null || v === undefined) return 'null';
+  if (typeof v === 'number') return String(v);
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  let s = String(v);
+  if (s === '') return "''";
+  // 需要加引号的情况：包含特殊字符、看起来像数字/布尔、以特殊符号开头
+  const needsQuote =
+    /[:#\[\]{}",\n]/.test(s) ||
+    /^[\s]/.test(s) ||
+    /[\s]$/.test(s) ||
+    /^(true|false|null|~|yes|no)$/i.test(s) ||
+    /^-?\d+(\.\d+)?$/.test(s) ||
+    s.startsWith('-') ||
+    s.startsWith('*') ||
+    s.startsWith('&') ||
+    s.startsWith('!') ||
+    s.startsWith('>') ||
+    s.startsWith('|') ||
+    s.startsWith('%') ||
+    s.startsWith('@') ||
+    s.startsWith('`');
+  if (needsQuote) {
+    return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  }
+  return s;
+}
+
+// value: object | array | scalar. 输出不带结尾多余空行的 YAML 片段（每行已含末尾换行）
+function yamlDump(value, indent = 0) {
+  const pad = '  '.repeat(indent);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return pad + '[]\n';
+    let out = '';
+    for (const item of value) {
+      if (item !== null && typeof item === 'object') {
+        const inner = yamlDump(item, indent + 1);
+        const lines = inner.split('\n').filter((l) => l.length > 0);
+        lines.forEach((line, i) => {
+          if (i === 0) {
+            // 把第一行的缩进替换为 "- "
+            out += pad + '- ' + line.slice(pad.length + 2) + '\n';
+          } else {
+            out += line + '\n';
+          }
+        });
+      } else {
+        out += pad + '- ' + yamlScalar(item) + '\n';
+      }
+    }
+    return out;
+  }
+  if (value !== null && typeof value === 'object') {
+    let out = '';
+    for (const [k, v] of Object.entries(value)) {
+      if (v === undefined) continue;
+      if (v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 0) continue;
+      if (Array.isArray(v) && v.length === 0) continue;
+      if (v !== null && typeof v === 'object') {
+        out += pad + k + ':\n' + yamlDump(v, indent + 1);
+      } else {
+        out += pad + k + ': ' + yamlScalar(v) + '\n';
+      }
+    }
+    return out;
+  }
+  return pad + yamlScalar(value) + '\n';
+}
+
+// ============================== 节点 URI 解析 ==============================
+// 统一输出结构（normalized node）供 Clash 转换与展示使用；raw 原文用于 base64/raw 输出。
+
+function safeUrlParse(raw) {
+  // vless/vmess/trojan/hysteria2 等非标准 scheme，WHATWG URL 仍可解析 authority
+  return new URL(raw);
+}
+
+function parseVless(raw) {
+  const u = safeUrlParse(raw);
+  const p = u.searchParams;
+  const name = decodeURIComponent(u.hash.replace(/^#/, '')) || u.hostname;
+  const security = p.get('security') || 'none';
+  return {
+    protocol: 'vless',
+    name,
+    server: u.hostname,
+    port: parseInt(u.port, 10),
+    uuid: decodeURIComponent(u.username),
+    security,
+    sni: p.get('sni') || p.get('host') || u.hostname,
+    network: p.get('type') || 'tcp',
+    wsPath: p.get('path') ? decodeURIComponent(p.get('path')) : '/',
+    wsHost: p.get('host') || p.get('sni') || u.hostname,
+    grpcServiceName: p.get('serviceName') || p.get('path') || '',
+    flow: p.get('flow') || '',
+    fp: p.get('fp') || '',
+    pbk: p.get('pbk') || '',
+    sid: p.get('sid') || '',
+    alpn: p.get('alpn') || '',
+    insecure: p.get('insecure') === '1' || p.get('allowInsecure') === '1',
+  };
+}
+
+function parseVmess(raw) {
+  const b64 = raw.replace(/^vmess:\/\//, '');
+  const json = JSON.parse(b64DecodeUtf8(b64));
+  const tls = String(json.tls || '').toLowerCase();
+  return {
+    protocol: 'vmess',
+    name: json.ps || json.add || 'vmess',
+    server: json.add,
+    port: parseInt(json.port, 10),
+    uuid: json.id,
+    aid: parseInt(json.aid || 0, 10),
+    cipher: json.scy || 'auto',
+    network: json.net || 'tcp',
+    tlsEnabled: tls === 'tls' || tls === 'reality',
+    sni: json.sni || json.host || json.add,
+    wsPath: json.path || '/',
+    wsHost: json.host || json.add,
+    grpcServiceName: json.path || '',
+    insecure: false,
+  };
+}
+
+function parseTrojan(raw) {
+  const u = safeUrlParse(raw);
+  const p = u.searchParams;
+  const name = decodeURIComponent(u.hash.replace(/^#/, '')) || u.hostname;
+  return {
+    protocol: 'trojan',
+    name,
+    server: u.hostname,
+    port: parseInt(u.port, 10),
+    password: decodeURIComponent(u.username),
+    sni: p.get('sni') || p.get('peer') || u.hostname,
+    network: p.get('type') || 'tcp',
+    wsPath: p.get('path') ? decodeURIComponent(p.get('path')) : '/',
+    wsHost: p.get('host') || u.hostname,
+    grpcServiceName: p.get('serviceName') || '',
+    insecure: p.get('allowInsecure') === '1' || p.get('insecure') === '1',
+  };
+}
+
+function parseSS(raw) {
+  let rest = raw.replace(/^ss:\/\//, '');
+  let name = '';
+  const hashIdx = rest.indexOf('#');
+  if (hashIdx >= 0) {
+    name = decodeURIComponent(rest.slice(hashIdx + 1));
+    rest = rest.slice(0, hashIdx);
+  }
+  const qIdx = rest.indexOf('?');
+  if (qIdx >= 0) rest = rest.slice(0, qIdx);
+
+  let method, password, server, port;
+  const atIdx = rest.lastIndexOf('@');
+  if (atIdx >= 0) {
+    // SIP002: base64(method:password)@host:port
+    const userinfo = rest.slice(0, atIdx);
+    const hostport = rest.slice(atIdx + 1);
+    let decoded;
+    try {
+      decoded = b64DecodeUtf8(userinfo);
+      if (!decoded.includes(':')) throw new Error('not method:password');
+    } catch (e) {
+      decoded = decodeURIComponent(userinfo);
+    }
+    [method, password] = splitFirst(decoded, ':');
+    [server, port] = splitLast(hostport, ':');
+  } else {
+    // legacy: base64(method:password@host:port)
+    const decoded = b64DecodeUtf8(rest);
+    const at2 = decoded.lastIndexOf('@');
+    const userinfo = decoded.slice(0, at2);
+    const hostport = decoded.slice(at2 + 1);
+    [method, password] = splitFirst(userinfo, ':');
+    [server, port] = splitLast(hostport, ':');
+  }
+  return {
+    protocol: 'ss',
+    name: name || server,
+    server,
+    port: parseInt(port, 10),
+    method,
+    password,
+  };
+}
+
+function parseHysteria2(raw) {
+  const normalized = raw.replace(/^hy2:\/\//, 'hysteria2://');
+  const u = safeUrlParse(normalized);
+  const p = u.searchParams;
+  const name = decodeURIComponent(u.hash.replace(/^#/, '')) || u.hostname;
+  return {
+    protocol: 'hysteria2',
+    name,
+    server: u.hostname,
+    port: parseInt(u.port, 10) || 443,
+    password: decodeURIComponent(u.username) + (u.password ? ':' + decodeURIComponent(u.password) : ''),
+    sni: p.get('sni') || p.get('peer') || u.hostname,
+    insecure: p.get('insecure') === '1',
+    obfs: p.get('obfs') || '',
+    obfsPassword: p.get('obfs-password') || '',
+  };
+}
+
+function detectProtocol(raw) {
+  const m = raw.trim().match(/^([a-z0-9]+):\/\//i);
+  if (!m) return null;
+  const scheme = m[1].toLowerCase();
+  if (scheme === 'hy2') return 'hysteria2';
+  if (['vless', 'vmess', 'trojan', 'ss', 'hysteria2'].includes(scheme)) return scheme;
+  return null;
+}
+
+function parseNodeUri(raw) {
+  raw = raw.trim();
+  const protocol = detectProtocol(raw);
+  if (!protocol) throw new Error('无法识别的协议: ' + raw.slice(0, 30));
+  let parsed;
+  if (protocol === 'vless') parsed = parseVless(raw);
+  else if (protocol === 'vmess') parsed = parseVmess(raw);
+  else if (protocol === 'trojan') parsed = parseTrojan(raw);
+  else if (protocol === 'ss') parsed = parseSS(raw);
+  else if (protocol === 'hysteria2') parsed = parseHysteria2(raw);
+  if (!parsed.server || !parsed.port) throw new Error('缺少 server/port: ' + raw.slice(0, 30));
+  parsed.raw = raw;
+  return parsed;
+}
+
+// ============================== Clash proxy 对象生成 ==============================
+
+function uniqueName(base, usedNames) {
+  let name = base || 'node';
+  let i = 2;
+  while (usedNames.has(name)) {
+    name = `${base} ${i}`;
+    i++;
+  }
+  usedNames.add(name);
+  return name;
+}
+
+function nodeToClashProxy(n) {
+  const proxy = { name: n.name, server: n.server, port: n.port, udp: true };
+  if (n.protocol === 'vless') {
+    proxy.type = 'vless';
+    proxy.uuid = n.uuid;
+    proxy.tls = n.security === 'tls' || n.security === 'reality';
+    proxy.network = n.network;
+    proxy['skip-cert-verify'] = !!n.insecure;
+    if (proxy.tls) proxy.servername = n.sni;
+    if (n.flow) proxy.flow = n.flow;
+    if (n.fp) proxy['client-fingerprint'] = n.fp;
+    if (n.security === 'reality') {
+      proxy['reality-opts'] = { 'public-key': n.pbk, 'short-id': n.sid };
+    }
+    if (n.network === 'ws') {
+      proxy['ws-opts'] = { path: n.wsPath, headers: { Host: n.wsHost } };
+    } else if (n.network === 'grpc') {
+      proxy['grpc-opts'] = { 'grpc-service-name': n.grpcServiceName };
+    }
+  } else if (n.protocol === 'vmess') {
+    proxy.type = 'vmess';
+    proxy.uuid = n.uuid;
+    proxy.alterId = n.aid;
+    proxy.cipher = n.cipher;
+    proxy.tls = !!n.tlsEnabled;
+    proxy.network = n.network;
+    if (proxy.tls) proxy.servername = n.sni;
+    if (n.network === 'ws') {
+      proxy['ws-opts'] = { path: n.wsPath, headers: { Host: n.wsHost } };
+    } else if (n.network === 'grpc') {
+      proxy['grpc-opts'] = { 'grpc-service-name': n.grpcServiceName };
+    }
+  } else if (n.protocol === 'trojan') {
+    proxy.type = 'trojan';
+    proxy.password = n.password;
+    proxy.sni = n.sni;
+    proxy['skip-cert-verify'] = !!n.insecure;
+    if (n.network && n.network !== 'tcp') {
+      proxy.network = n.network;
+      if (n.network === 'ws') proxy['ws-opts'] = { path: n.wsPath, headers: { Host: n.wsHost } };
+      if (n.network === 'grpc') proxy['grpc-opts'] = { 'grpc-service-name': n.grpcServiceName };
+    }
+  } else if (n.protocol === 'ss') {
+    proxy.type = 'ss';
+    proxy.cipher = n.method;
+    proxy.password = n.password;
+  } else if (n.protocol === 'hysteria2') {
+    proxy.type = 'hysteria2';
+    proxy.password = n.password;
+    proxy.sni = n.sni;
+    proxy['skip-cert-verify'] = !!n.insecure;
+    if (n.obfs) {
+      proxy.obfs = n.obfs;
+      proxy['obfs-password'] = n.obfsPassword;
+    }
+  }
+  return proxy;
+}
+
+// ============================== KV 数据访问 ==============================
+
+const KV_NODES = 'nodes';
+const KV_SOURCES = 'sources';
+const KV_TOKENS = 'tokens';
+
+async function kvGetJson(kv, key, fallback) {
+  const v = await kv.get(key, 'json');
+  return v === null || v === undefined ? fallback : v;
+}
+
+async function kvPutJson(kv, key, value) {
+  await kv.put(key, JSON.stringify(value));
+}
+
+async function getNodes(kv) {
+  return kvGetJson(kv, KV_NODES, []);
+}
+async function saveNodes(kv, list) {
+  return kvPutJson(kv, KV_NODES, list);
+}
+async function getSources(kv) {
+  return kvGetJson(kv, KV_SOURCES, []);
+}
+async function saveSources(kv, list) {
+  return kvPutJson(kv, KV_SOURCES, list);
+}
+async function getTokens(kv) {
+  return kvGetJson(kv, KV_TOKENS, []);
+}
+async function saveTokens(kv, list) {
+  return kvPutJson(kv, KV_TOKENS, list);
+}
+
+// ============================== 鉴权 ==============================
+
+const SESSION_TTL = 7 * 24 * 3600; // 7 天
+
+async function createSession(kv, username) {
+  const sid = uid(32);
+  await kv.put('session:' + sid, JSON.stringify({ username, exp: Date.now() + SESSION_TTL * 1000 }), {
+    expirationTtl: SESSION_TTL,
+  });
+  return sid;
+}
+
+async function getSession(kv, req) {
+  const cookies = parseCookies(req);
+  const sid = cookies['sid'];
+  if (!sid) return null;
+  const s = await kv.get('session:' + sid, 'json');
+  return s;
+}
+
+async function requireAuth(kv, req) {
+  const s = await getSession(kv, req);
+  return !!s;
+}
+
+function setCookieHeader(sid, maxAge) {
+  return `sid=${sid}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
+}
+
+function clearCookieHeader() {
+  return `sid=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
+}
+
+// ============================== 订阅聚合 ==============================
+
+async function fetchSourceNodes(url) {
+  const res = await fetch(url, { headers: { 'User-Agent': 'ClashMetaForAndroid/2.10' } });
+  if (!res.ok) throw new Error('源站请求失败: HTTP ' + res.status);
+  let text = await res.text();
+  text = text.trim();
+  // 尝试整体 base64 解码
+  if (looksLikeBase64(text) && !/^(vless|vmess|trojan|ss|hysteria2|hy2):\/\//im.test(text)) {
+    try {
+      const decoded = b64DecodeUtf8(text);
+      if (/:\/\//.test(decoded)) text = decoded;
+    } catch (e) {
+      /* 保持原文，可能本身就是明文 */
+    }
+  }
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const nodes = [];
+  for (const line of lines) {
+    const proto = detectProtocol(line);
+    if (!proto) continue;
+    try {
+      nodes.push(parseNodeUri(line));
+    } catch (e) {
+      // 跳过无法解析的行
+    }
+  }
+  return nodes;
+}
+
+async function collectTokenNodes(kv, tokenRecord) {
+  const allNodes = await getNodes(kv);
+  const allSources = await getSources(kv);
+
+  let manualNodes;
+  if (tokenRecord.includeAllNodes) {
+    manualNodes = allNodes.filter((n) => n.enabled !== false);
+  } else {
+    const idSet = new Set(tokenRecord.nodeIds || []);
+    manualNodes = allNodes.filter((n) => idSet.has(n.id) && n.enabled !== false);
+  }
+  const manualParsed = [];
+  for (const n of manualNodes) {
+    try {
+      manualParsed.push(parseNodeUri(n.raw));
+    } catch (e) {
+      /* 忽略损坏节点 */
+    }
+  }
+
+  let sources;
+  if (tokenRecord.includeAllSources) {
+    sources = allSources.filter((s) => s.enabled !== false);
+  } else {
+    const idSet = new Set(tokenRecord.sourceIds || []);
+    sources = allSources.filter((s) => idSet.has(s.id) && s.enabled !== false);
+  }
+
+  const remoteResults = await Promise.allSettled(sources.map((s) => fetchSourceNodes(s.url)));
+  const remoteParsed = [];
+  remoteResults.forEach((r) => {
+    if (r.status === 'fulfilled') remoteParsed.push(...r.value);
+  });
+
+  // 去重：以 protocol+server+port+uuid/password 为 key
+  const seen = new Set();
+  const merged = [];
+  for (const n of [...manualParsed, ...remoteParsed]) {
+    const key = [n.protocol, n.server, n.port, n.uuid || n.password || ''].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(n);
+  }
+  return merged;
+}
+
+// ---- Clash 分组名称（防 DNS 泄漏规则集依赖这两个组名） ----
+const PROXY_GROUP_MAIN = '🚀 节点选择';
+const PROXY_GROUP_AUTO = '♻️ 自动选择';
+
+function buildClashYaml(nodes, tokenRecord) {
+  const usedNames = new Set();
+  nodes.forEach((n) => {
+    n.name = uniqueName(n.name || n.server, usedNames);
+  });
+  const proxies = nodes.map(nodeToClashProxy);
+  const proxyNames = proxies.map((p) => p.name);
+
+  const config = {
+    'mixed-port': 7890,
+    'allow-lan': true,
+    mode: 'rule',
+    'log-level': 'info',
+    'external-controller': '127.0.0.1:9090',
+    dns: {
+      enable: true,
+      'default-nameserver': ['223.5.5.5', '119.29.29.29'],
+      nameserver: ['https://doh.pub/dns-query', 'https://dns.alidns.com/dns-query'],
+    },
+    proxies,
+    'proxy-groups': [
+      {
+        name: PROXY_GROUP_MAIN,
+        type: 'select',
+        proxies: [PROXY_GROUP_AUTO, 'DIRECT', ...proxyNames],
+      },
+      {
+        name: PROXY_GROUP_AUTO,
+        type: 'url-test',
+        proxies: proxyNames.length ? proxyNames : ['DIRECT'],
+        url: 'https://www.gstatic.com/generate_204',
+        interval: 300,
+        tolerance: 50,
+      },
+    ],
+    // 防 DNS 泄漏规则集（参考 ACL4SSR nodnsleak.ini 的 [custom] 规则）
+    'rule-providers': {
+      GoogleCNProxyIP: {
+        type: 'http',
+        behavior: 'classical',
+        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/GoogleCNProxyIP.list',
+        path: './ruleset/GoogleCNProxyIP.yaml',
+        interval: 86400,
+      },
+      LocalAreaNetwork: {
+        type: 'http',
+        behavior: 'classical',
+        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/LocalAreaNetwork.list',
+        path: './ruleset/LocalAreaNetwork.yaml',
+        interval: 86400,
+      },
+      UnBan: {
+        type: 'http',
+        behavior: 'classical',
+        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/UnBan.list',
+        path: './ruleset/UnBan.yaml',
+        interval: 86400,
+      },
+      ChinaDomain: {
+        type: 'http',
+        behavior: 'classical',
+        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaDomain.list',
+        path: './ruleset/ChinaDomain.yaml',
+        interval: 86400,
+      },
+      ChinaMedia: {
+        type: 'http',
+        behavior: 'classical',
+        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaMedia.list',
+        path: './ruleset/ChinaMedia.yaml',
+        interval: 86400,
+      },
+      BanAD: {
+        type: 'http',
+        behavior: 'classical',
+        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/BanAD.list',
+        path: './ruleset/BanAD.yaml',
+        interval: 86400,
+      },
+      BanProgramAD: {
+        type: 'http',
+        behavior: 'classical',
+        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/BanProgramAD.list',
+        path: './ruleset/BanProgramAD.yaml',
+        interval: 86400,
+      },
+      ChinaCompanyIp: {
+        type: 'http',
+        behavior: 'classical',
+        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaCompanyIp.list',
+        path: './ruleset/ChinaCompanyIp.yaml',
+        interval: 86400,
+      },
+      ChinaIp: {
+        type: 'http',
+        behavior: 'classical',
+        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaIp.list',
+        path: './ruleset/ChinaIp.yaml',
+        interval: 86400,
+      },
+    },
+    rules: [
+      `DOMAIN-SUFFIX,xn--ngstr-lra8j.com,${PROXY_GROUP_MAIN}`,
+      `DOMAIN-SUFFIX,services.googleapis.cn,${PROXY_GROUP_MAIN}`,
+      `RULE-SET,GoogleCNProxyIP,${PROXY_GROUP_MAIN}`,
+      'RULE-SET,LocalAreaNetwork,DIRECT',
+      'RULE-SET,UnBan,DIRECT',
+      'RULE-SET,ChinaDomain,DIRECT',
+      'RULE-SET,ChinaMedia,DIRECT',
+      'RULE-SET,BanAD,REJECT',
+      'RULE-SET,BanProgramAD,REJECT',
+      'RULE-SET,ChinaCompanyIp,DIRECT',
+      'RULE-SET,ChinaIp,DIRECT',
+      'GEOIP,CN,DIRECT,no-resolve',
+      `MATCH,${PROXY_GROUP_MAIN}`,
+    ],
+  };
+
+  let yaml = '# 聚合订阅 - 自动生成\n';
+  yaml += `# 名称: ${tokenRecord.name || ''}\n`;
+  yaml += yamlDump(config, 0);
+  return yaml;
+}
+
+function buildRawSubscription(nodes) {
+  const lines = nodes.map((n) => n.raw);
+  return b64EncodeUtf8(lines.join('\n'));
+}
+
+function subUserInfoHeader(meta) {
+  const upload = meta.upload || 0;
+  const download = meta.download || 0;
+  const total = meta.total || 0;
+  const parts = [`upload=${upload}`, `download=${download}`, `total=${total}`];
+  if (meta.expire) parts.push(`expire=${meta.expire}`);
+  return parts.join('; ');
+}
+
+function isClashUA(ua) {
+  return /clash|mihomo|meta|openclash|stash|surge/i.test(ua || '');
+}
+
+// ============================== API 路由处理 ==============================
+
+async function handleApi(req, env, url) {
+  const kv = env.SUB_KV;
+  const method = req.method;
+  const path = url.pathname;
+
+  if (path === '/api/login' && method === 'POST') {
+    const body = await req.json().catch(() => ({}));
+    const { username, password } = body;
+    if (
+      username === env.ADMIN_USERNAME &&
+      password === env.ADMIN_PASSWORD &&
+      env.ADMIN_USERNAME &&
+      env.ADMIN_PASSWORD
+    ) {
+      const sid = await createSession(kv, username);
+      return jsonResponse({ ok: true }, 200, { 'Set-Cookie': setCookieHeader(sid, SESSION_TTL) });
+    }
+    return jsonResponse({ ok: false, error: '用户名或密码错误' }, 401);
+  }
+
+  if (path === '/api/logout' && method === 'POST') {
+    const cookies = parseCookies(req);
+    if (cookies['sid']) await kv.delete('session:' + cookies['sid']);
+    return jsonResponse({ ok: true }, 200, { 'Set-Cookie': clearCookieHeader() });
+  }
+
+  // 以下接口需要登录
+  const authed = await requireAuth(kv, req);
+  if (!authed) return jsonResponse({ ok: false, error: '未登录' }, 401);
+
+  // ---- 节点 ----
+  if (path === '/api/nodes' && method === 'GET') {
+    const nodes = await getNodes(kv);
+    return jsonResponse({ ok: true, data: nodes });
+  }
+  if (path === '/api/nodes' && method === 'POST') {
+    const body = await req.json().catch(() => ({}));
+    const text = String(body.raw || '');
+    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const nodes = await getNodes(kv);
+    const added = [];
+    const failed = [];
+    for (const line of lines) {
+      try {
+        const parsed = parseNodeUri(line);
+        const record = {
+          id: uid(10),
+          raw: line,
+          protocol: parsed.protocol,
+          name: parsed.name,
+          server: parsed.server,
+          port: parsed.port,
+          enabled: true,
+          addedAt: Date.now(),
+        };
+        nodes.push(record);
+        added.push(record);
+      } catch (e) {
+        failed.push({ line, error: e.message });
+      }
+    }
+    await saveNodes(kv, nodes);
+    return jsonResponse({ ok: true, added, failed });
+  }
+  {
+    const m = path.match(/^\/api\/nodes\/([^/]+)$/);
+    if (m && (method === 'PUT' || method === 'DELETE')) {
+      const id = m[1];
+      let nodes = await getNodes(kv);
+      if (method === 'DELETE') {
+        nodes = nodes.filter((n) => n.id !== id);
+        await saveNodes(kv, nodes);
+        return jsonResponse({ ok: true });
+      }
+      const body = await req.json().catch(() => ({}));
+      const idx = nodes.findIndex((n) => n.id === id);
+      if (idx < 0) return jsonResponse({ ok: false, error: '节点不存在' }, 404);
+
+      // 支持二次修改节点链接本身（raw），重新解析并刷新 protocol/server/port/name
+      if (typeof body.raw === 'string' && body.raw.trim()) {
+        let parsed;
+        try {
+          parsed = parseNodeUri(body.raw.trim());
+        } catch (e) {
+          return jsonResponse({ ok: false, error: '节点链接解析失败: ' + e.message }, 400);
+        }
+        nodes[idx].raw = body.raw.trim();
+        nodes[idx].protocol = parsed.protocol;
+        nodes[idx].server = parsed.server;
+        nodes[idx].port = parsed.port;
+        nodes[idx].name = parsed.name;
+      }
+      // 显式传入的 name 会覆盖从链接中解析出的名称
+      if (typeof body.name === 'string' && body.name.trim()) nodes[idx].name = body.name.trim();
+      if (typeof body.enabled === 'boolean') nodes[idx].enabled = body.enabled;
+      await saveNodes(kv, nodes);
+      return jsonResponse({ ok: true, data: nodes[idx] });
+    }
+  }
+
+  // ---- 订阅源 ----
+  if (path === '/api/sources' && method === 'GET') {
+    return jsonResponse({ ok: true, data: await getSources(kv) });
+  }
+  if (path === '/api/sources' && method === 'POST') {
+    const body = await req.json().catch(() => ({}));
+    if (!body.url) return jsonResponse({ ok: false, error: '缺少 url' }, 400);
+    const sources = await getSources(kv);
+    const record = { id: uid(10), url: body.url, name: body.name || body.url, enabled: true, addedAt: Date.now() };
+    sources.push(record);
+    await saveSources(kv, sources);
+    return jsonResponse({ ok: true, data: record });
+  }
+  {
+    const m = path.match(/^\/api\/sources\/([^/]+)$/);
+    if (m && (method === 'PUT' || method === 'DELETE')) {
+      const id = m[1];
+      let sources = await getSources(kv);
+      if (method === 'DELETE') {
+        sources = sources.filter((s) => s.id !== id);
+        await saveSources(kv, sources);
+        return jsonResponse({ ok: true });
+      }
+      const body = await req.json().catch(() => ({}));
+      const idx = sources.findIndex((s) => s.id === id);
+      if (idx < 0) return jsonResponse({ ok: false, error: '订阅源不存在' }, 404);
+      if (typeof body.name === 'string') sources[idx].name = body.name;
+      if (typeof body.enabled === 'boolean') sources[idx].enabled = body.enabled;
+      if (typeof body.url === 'string') sources[idx].url = body.url;
+      await saveSources(kv, sources);
+      return jsonResponse({ ok: true, data: sources[idx] });
+    }
+  }
+
+  // ---- 订阅口令 ----
+  if (path === '/api/tokens' && method === 'GET') {
+    return jsonResponse({ ok: true, data: await getTokens(kv) });
+  }
+  if (path === '/api/tokens' && method === 'POST') {
+    const body = await req.json().catch(() => ({}));
+    const tokens = await getTokens(kv);
+    const record = {
+      token: randomToken(28),
+      name: body.name || '未命名订阅',
+      nodeIds: Array.isArray(body.nodeIds) ? body.nodeIds : [],
+      sourceIds: Array.isArray(body.sourceIds) ? body.sourceIds : [],
+      includeAllNodes: !!body.includeAllNodes,
+      includeAllSources: !!body.includeAllSources,
+      enabled: true,
+      meta: {
+        total: Number(body.meta?.total) || 0,
+        upload: Number(body.meta?.upload) || 0,
+        download: Number(body.meta?.download) || 0,
+        expire: body.meta?.expire ? Number(body.meta.expire) : 0,
+      },
+      createdAt: Date.now(),
+    };
+    tokens.push(record);
+    await saveTokens(kv, tokens);
+    return jsonResponse({ ok: true, data: record });
+  }
+  {
+    const m = path.match(/^\/api\/tokens\/([^/]+)$/);
+    if (m && (method === 'PUT' || method === 'DELETE')) {
+      const token = m[1];
+      let tokens = await getTokens(kv);
+      if (method === 'DELETE') {
+        tokens = tokens.filter((t) => t.token !== token);
+        await saveTokens(kv, tokens);
+        return jsonResponse({ ok: true });
+      }
+      const body = await req.json().catch(() => ({}));
+      const idx = tokens.findIndex((t) => t.token === token);
+      if (idx < 0) return jsonResponse({ ok: false, error: '订阅不存在' }, 404);
+      const t = tokens[idx];
+      if (typeof body.name === 'string') t.name = body.name;
+      if (typeof body.enabled === 'boolean') t.enabled = body.enabled;
+      if (Array.isArray(body.nodeIds)) t.nodeIds = body.nodeIds;
+      if (Array.isArray(body.sourceIds)) t.sourceIds = body.sourceIds;
+      if (typeof body.includeAllNodes === 'boolean') t.includeAllNodes = body.includeAllNodes;
+      if (typeof body.includeAllSources === 'boolean') t.includeAllSources = body.includeAllSources;
+      if (body.meta) {
+        t.meta = {
+          total: Number(body.meta.total) || 0,
+          upload: Number(body.meta.upload) || 0,
+          download: Number(body.meta.download) || 0,
+          expire: body.meta.expire ? Number(body.meta.expire) : 0,
+        };
+      }
+      await saveTokens(kv, tokens);
+      return jsonResponse({ ok: true, data: t });
+    }
+  }
+
+  return jsonResponse({ ok: false, error: 'Not Found' }, 404);
+}
+
+// ============================== 订阅输出 ==============================
+
+async function handleSub(req, env, url) {
+  const kv = env.SUB_KV;
+  const token = url.pathname.replace(/^\/sub\//, '');
+  const tokens = await getTokens(kv);
+  const record = tokens.find((t) => t.token === token);
+  if (!record || record.enabled === false) {
+    return new Response('订阅不存在或已停用', { status: 404 });
+  }
+
+  let nodes;
+  try {
+    nodes = await collectTokenNodes(kv, record);
+  } catch (e) {
+    return new Response('聚合节点失败: ' + e.message, { status: 502 });
+  }
+
+  const ua = req.headers.get('User-Agent') || '';
+  const target = url.searchParams.get('target'); // clash | raw
+  const useClash = target === 'clash' || (target !== 'raw' && isClashUA(ua));
+
+  const headers = {
+    'Subscription-Userinfo': subUserInfoHeader(record.meta),
+    'Cache-Control': 'no-store',
+  };
+
+  if (useClash) {
+    const yaml = buildClashYaml(nodes, record);
+    headers['Content-Type'] = 'text/yaml; charset=utf-8';
+    headers['Content-Disposition'] = `attachment; filename="${encodeURIComponent(record.name)}.yaml"`;
+    return new Response(yaml, { status: 200, headers });
+  } else {
+    const b64 = buildRawSubscription(nodes);
+    headers['Content-Type'] = 'text/plain; charset=utf-8';
+    headers['Content-Disposition'] = `attachment; filename="${encodeURIComponent(record.name)}.txt"`;
+    return new Response(b64, { status: 200, headers });
+  }
+}
+
+// ============================== 前端页面（登录 + 控制台） ==============================
+
+const LOGIN_HTML = `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · 节点中枢</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap');
+  :root{--bg:#0b0f0d;--panel:#111815;--line:#1f2b25;--text:#dbe8e1;--dim:#7c9186;--accent:#39e07a;--accent-dim:#1f8a4d;}
+  *{box-sizing:border-box;}
+  body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font-family:'IBM Plex Mono',monospace;display:flex;align-items:center;justify-content:center;
+    background-image:radial-gradient(circle at 20% 20%, rgba(57,224,122,0.06), transparent 40%),radial-gradient(circle at 80% 80%, rgba(57,224,122,0.04), transparent 40%);}
+  .card{width:360px;padding:36px 32px;background:var(--panel);border:1px solid var(--line);border-radius:2px;position:relative;}
+  .card::before{content:'';position:absolute;top:0;left:0;width:36px;height:2px;background:var(--accent);}
+  h1{font-family:'Space Grotesk',sans-serif;font-size:20px;letter-spacing:.04em;margin:0 0 4px;}
+  .sub{color:var(--dim);font-size:12px;margin-bottom:28px;letter-spacing:.05em;}
+  label{display:block;font-size:11px;color:var(--dim);margin-bottom:6px;letter-spacing:.08em;text-transform:uppercase;}
+  input{width:100%;padding:11px 12px;margin-bottom:18px;background:#0d1310;border:1px solid var(--line);color:var(--text);font-family:inherit;font-size:14px;border-radius:2px;outline:none;}
+  input:focus{border-color:var(--accent-dim);}
+  button{width:100%;padding:12px;background:var(--accent);color:#04150a;border:none;font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:14px;letter-spacing:.03em;border-radius:2px;cursor:pointer;}
+  button:hover{background:#4dee8c;}
+  .err{color:#ff6b6b;font-size:12px;margin-top:12px;min-height:14px;}
+</style></head>
+<body>
+  <form class="card" id="f">
+    <h1>节点中枢</h1>
+    <div class="sub">SUBSCRIPTION AGGREGATOR // ADMIN LOGIN</div>
+    <label>用户名</label>
+    <input name="username" autocomplete="username" required>
+    <label>密码</label>
+    <input name="password" type="password" autocomplete="current-password" required>
+    <button type="submit">登 录</button>
+    <div class="err" id="err"></div>
+  </form>
+<script>
+document.getElementById('f').addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const res = await fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username: fd.get('username'), password: fd.get('password')})});
+  const data = await res.json();
+  if(data.ok){ location.href = '/'; } else { document.getElementById('err').textContent = data.error || '登录失败'; }
+});
+</script>
+</body></html>`;
+
+const PORTAL_HTML = `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>节点中枢 · 控制台</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap');
+  :root{--bg:#0b0f0d;--panel:#111815;--panel2:#0d1310;--line:#1f2b25;--text:#dbe8e1;--dim:#7c9186;--accent:#39e07a;--accent-dim:#1f8a4d;--red:#ff6b6b;}
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:13px;}
+  header{display:flex;align-items:center;justify-content:space-between;padding:18px 28px;border-bottom:1px solid var(--line);}
+  header h1{font-family:'Space Grotesk',sans-serif;font-size:18px;margin:0;letter-spacing:.03em;}
+  header h1 span{color:var(--accent);}
+  header button{background:none;border:1px solid var(--line);color:var(--dim);padding:7px 14px;border-radius:2px;cursor:pointer;font-family:inherit;}
+  header button:hover{border-color:var(--accent-dim);color:var(--text);}
+  nav{display:flex;gap:2px;padding:0 28px;border-bottom:1px solid var(--line);}
+  nav button{background:none;border:none;color:var(--dim);padding:12px 18px;cursor:pointer;font-family:'Space Grotesk',sans-serif;font-size:13px;letter-spacing:.02em;border-bottom:2px solid transparent;}
+  nav button.active{color:var(--accent);border-bottom-color:var(--accent);}
+  main{padding:24px 28px 60px;max-width:1080px;margin:0 auto;}
+  .panel{display:none;}
+  .panel.active{display:block;}
+  .toolbar{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;align-items:center;}
+  textarea, input, select{background:var(--panel2);border:1px solid var(--line);color:var(--text);font-family:inherit;padding:9px 10px;border-radius:2px;outline:none;}
+  textarea:focus, input:focus, select:focus{border-color:var(--accent-dim);}
+  textarea{width:100%;min-height:90px;resize:vertical;}
+  button.primary{background:var(--accent);color:#04150a;border:none;padding:9px 18px;border-radius:2px;cursor:pointer;font-family:'Space Grotesk',sans-serif;font-weight:600;letter-spacing:.02em;}
+  button.primary:hover{background:#4dee8c;}
+  button.ghost{background:none;border:1px solid var(--line);color:var(--dim);padding:6px 12px;border-radius:2px;cursor:pointer;font-family:inherit;}
+  button.ghost:hover{border-color:var(--accent-dim);color:var(--text);}
+  button.danger{color:var(--red);border-color:#3a1f1f;}
+  table{width:100%;border-collapse:collapse;margin-top:6px;}
+  th{text-align:left;color:var(--dim);font-weight:500;font-size:11px;letter-spacing:.06em;text-transform:uppercase;padding:8px 10px;border-bottom:1px solid var(--line);}
+  td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:middle;}
+  tr:hover td{background:rgba(57,224,122,0.03);}
+  .tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;border:1px solid var(--line);color:var(--dim);}
+  .tag.on{color:var(--accent);border-color:var(--accent-dim);}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:6px;}
+  .dot.on{background:var(--accent);}
+  .dot.off{background:#555;}
+  .mono{color:var(--dim);font-size:12px;}
+  .row-actions{display:flex;gap:6px;}
+  .empty{color:var(--dim);padding:30px 0;text-align:center;}
+  .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,0.6);display:none;align-items:center;justify-content:center;z-index:50;}
+  .modal-bg.show{display:flex;}
+  .modal{width:480px;max-width:92vw;max-height:86vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:3px;padding:24px;}
+  .modal h3{font-family:'Space Grotesk',sans-serif;margin:0 0 16px;font-size:16px;}
+  .field{margin-bottom:14px;}
+  .field label{display:block;font-size:11px;color:var(--dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em;}
+  .field input, .field select{width:100%;}
+  .checklist{max-height:150px;overflow:auto;border:1px solid var(--line);border-radius:2px;padding:8px;}
+  .checklist label{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text);padding:4px 0;text-transform:none;}
+  .modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px;}
+  .subrow{display:flex;align-items:center;gap:8px;}
+  .copybox{display:flex;gap:6px;}
+  .copybox input{flex:1;font-size:11px;}
+  .metagrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+  .toast{position:fixed;bottom:20px;right:20px;background:var(--panel);border:1px solid var(--accent-dim);color:var(--accent);padding:10px 16px;border-radius:3px;font-size:12px;opacity:0;transform:translateY(10px);transition:.25s;pointer-events:none;}
+  .toast.show{opacity:1;transform:translateY(0);}
+</style></head>
+<body>
+<header>
+  <h1>节点<span>中枢</span></h1>
+  <button id="logoutBtn">退出登录</button>
+</header>
+<nav>
+  <button data-tab="nodes" class="active">节点</button>
+  <button data-tab="sources">订阅源</button>
+  <button data-tab="tokens">订阅口令</button>
+</nav>
+<main>
+  <!-- 节点面板 -->
+  <section class="panel active" id="panel-nodes">
+    <div class="toolbar">
+      <button class="primary" id="addNodeBtn">添加节点</button>
+      <span class="mono" id="nodeCount"></span>
+    </div>
+    <table><thead><tr><th></th><th>名称</th><th>协议</th><th>地址</th><th>状态</th><th></th></tr></thead>
+      <tbody id="nodeTbody"></tbody></table>
+    <div class="empty" id="nodeEmpty" style="display:none;">暂无节点，点击上方"添加节点"粘贴 vless / vmess / trojan / ss / hysteria2 链接</div>
+  </section>
+
+  <!-- 订阅源面板 -->
+  <section class="panel" id="panel-sources">
+    <div class="toolbar">
+      <button class="primary" id="addSourceBtn">添加订阅源</button>
+      <span class="mono" id="sourceCount"></span>
+    </div>
+    <table><thead><tr><th></th><th>名称</th><th>URL</th><th>状态</th><th></th></tr></thead>
+      <tbody id="sourceTbody"></tbody></table>
+    <div class="empty" id="sourceEmpty" style="display:none;">暂无订阅源，点击上方"添加订阅源"填入远程订阅链接（实时抓取聚合）</div>
+  </section>
+
+  <!-- 订阅口令面板 -->
+  <section class="panel" id="panel-tokens">
+    <div class="toolbar">
+      <button class="primary" id="addTokenBtn">创建订阅</button>
+      <span class="mono" id="tokenCount"></span>
+    </div>
+    <table><thead><tr><th></th><th>名称</th><th>包含</th><th>到期</th><th>订阅链接</th><th></th></tr></thead>
+      <tbody id="tokenTbody"></tbody></table>
+    <div class="empty" id="tokenEmpty" style="display:none;">暂无订阅口令，创建后可在 Shadowrocket / OpenClash 中导入</div>
+  </section>
+</main>
+
+<div class="modal-bg" id="modalBg"><div class="modal" id="modalBody"></div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+const state = { nodes: [], sources: [], tokens: [] };
+
+function toast(msg){
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 1800);
+}
+async function api(path, opts){
+  const res = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
+  if(res.status === 401){ location.href = '/login'; throw new Error('未登录'); }
+  return res.json();
+}
+
+// ---- Tabs ----
+document.querySelectorAll('nav button').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    document.querySelectorAll('nav button').forEach(b=>b.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('panel-'+btn.dataset.tab).classList.add('active');
+  });
+});
+document.getElementById('logoutBtn').addEventListener('click', async ()=>{
+  await api('/api/logout', {method:'POST'});
+  location.href = '/login';
+});
+
+// ---- Modal helper ----
+function openModal(html){
+  document.getElementById('modalBody').innerHTML = html;
+  document.getElementById('modalBg').classList.add('show');
+}
+function closeModal(){ document.getElementById('modalBg').classList.remove('show'); }
+document.getElementById('modalBg').addEventListener('click', (e)=>{ if(e.target.id==='modalBg') closeModal(); });
+
+// ============ 节点 ============
+async function loadNodes(){
+  const r = await api('/api/nodes');
+  state.nodes = r.data || [];
+  renderNodes();
+}
+function renderNodes(){
+  const tbody = document.getElementById('nodeTbody');
+  document.getElementById('nodeCount').textContent = state.nodes.length + ' 个节点';
+  document.getElementById('nodeEmpty').style.display = state.nodes.length ? 'none' : 'block';
+  tbody.innerHTML = state.nodes.map(n => \`
+    <tr>
+      <td><span class="dot \${n.enabled!==false?'on':'off'}"></span></td>
+      <td>\${escapeHtml(n.name)}</td>
+      <td><span class="tag">\${n.protocol}</span></td>
+      <td class="mono">\${escapeHtml(n.server)}:\${n.port}</td>
+      <td><span class="tag \${n.enabled!==false?'on':''}">\${n.enabled!==false?'启用':'停用'}</span></td>
+      <td class="row-actions">
+        <button class="ghost" onclick="editNode('\${n.id}')">编辑</button>
+        <button class="ghost" onclick="toggleNode('\${n.id}', \${n.enabled===false})">\${n.enabled!==false?'停用':'启用'}</button>
+        <button class="ghost danger" onclick="deleteNode('\${n.id}')">删除</button>
+      </td>
+    </tr>\`).join('');
+}
+async function toggleNode(id, enabled){
+  await api('/api/nodes/'+id, {method:'PUT', body: JSON.stringify({enabled})});
+  loadNodes();
+}
+async function deleteNode(id){
+  if(!confirm('确认删除该节点？')) return;
+  await api('/api/nodes/'+id, {method:'DELETE'});
+  loadNodes(); loadTokensQuiet();
+}
+document.getElementById('addNodeBtn').addEventListener('click', ()=>{
+  openModal(\`
+    <h3>添加节点</h3>
+    <div class="field">
+      <label>节点链接（每行一条，支持 vless / vmess / trojan / ss / hysteria2）</label>
+      <textarea id="nodeRaw" placeholder="vless://...\\ntrojan://...\\nvmess://..."></textarea>
+    </div>
+    <div class="modal-actions">
+      <button class="ghost" onclick="closeModal()">取消</button>
+      <button class="primary" onclick="submitNode()">添加</button>
+    </div>
+  \`);
+});
+async function submitNode(){
+  const raw = document.getElementById('nodeRaw').value.trim();
+  if(!raw) return;
+  const r = await api('/api/nodes', {method:'POST', body: JSON.stringify({raw})});
+  closeModal();
+  loadNodes();
+  if(r.failed && r.failed.length){
+    toast(\`成功 \${r.added.length} 条，失败 \${r.failed.length} 条\`);
+  } else {
+    toast(\`成功添加 \${r.added.length} 个节点\`);
+  }
+}
+
+// ---- 编辑已保存的节点（二次修改） ----
+function editNode(id){
+  const n = state.nodes.find(x=>x.id===id);
+  if(!n) return;
+  openModal(\`
+    <h3>编辑节点</h3>
+    <div class="field">
+      <label>节点链接</label>
+      <textarea id="editNodeRaw" style="min-height:80px;">\${escapeHtml(n.raw)}</textarea>
+    </div>
+    <div class="field">
+      <label>备注名称（留空则使用链接中携带的名称）</label>
+      <input id="editNodeName" value="\${escapeHtml(n.name)}">
+    </div>
+    <div class="modal-actions">
+      <button class="ghost" onclick="closeModal()">取消</button>
+      <button class="primary" onclick="submitNodeEdit('\${id}')">保存</button>
+    </div>
+  \`);
+}
+async function submitNodeEdit(id){
+  const raw = document.getElementById('editNodeRaw').value.trim();
+  const name = document.getElementById('editNodeName').value.trim();
+  if(!raw){ toast('节点链接不能为空'); return; }
+  const body = { raw };
+  if(name) body.name = name;
+  const r = await api('/api/nodes/'+id, {method:'PUT', body: JSON.stringify(body)});
+  if(r.ok === false){ toast(r.error || '保存失败'); return; }
+  closeModal();
+  loadNodes(); loadTokensQuiet();
+  toast('节点已更新');
+}
+
+// ============ 订阅源 ============
+async function loadSources(){
+  const r = await api('/api/sources');
+  state.sources = r.data || [];
+  renderSources();
+}
+function renderSources(){
+  const tbody = document.getElementById('sourceTbody');
+  document.getElementById('sourceCount').textContent = state.sources.length + ' 个订阅源';
+  document.getElementById('sourceEmpty').style.display = state.sources.length ? 'none' : 'block';
+  tbody.innerHTML = state.sources.map(s => \`
+    <tr>
+      <td><span class="dot \${s.enabled!==false?'on':'off'}"></span></td>
+      <td>\${escapeHtml(s.name)}</td>
+      <td class="mono" style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">\${escapeHtml(s.url)}</td>
+      <td><span class="tag \${s.enabled!==false?'on':''}">\${s.enabled!==false?'启用':'停用'}</span></td>
+      <td class="row-actions">
+        <button class="ghost" onclick="toggleSource('\${s.id}', \${s.enabled===false})">\${s.enabled!==false?'停用':'启用'}</button>
+        <button class="ghost danger" onclick="deleteSource('\${s.id}')">删除</button>
+      </td>
+    </tr>\`).join('');
+}
+async function toggleSource(id, enabled){
+  await api('/api/sources/'+id, {method:'PUT', body: JSON.stringify({enabled})});
+  loadSources();
+}
+async function deleteSource(id){
+  if(!confirm('确认删除该订阅源？')) return;
+  await api('/api/sources/'+id, {method:'DELETE'});
+  loadSources(); loadTokensQuiet();
+}
+document.getElementById('addSourceBtn').addEventListener('click', ()=>{
+  openModal(\`
+    <h3>添加订阅源</h3>
+    <div class="field"><label>名称</label><input id="srcName" placeholder="例如：机场A"></div>
+    <div class="field"><label>订阅 URL</label><input id="srcUrl" placeholder="https://example.com/sub?token=xxx"></div>
+    <div class="modal-actions">
+      <button class="ghost" onclick="closeModal()">取消</button>
+      <button class="primary" onclick="submitSource()">添加</button>
+    </div>
+  \`);
+});
+async function submitSource(){
+  const name = document.getElementById('srcName').value.trim();
+  const url = document.getElementById('srcUrl').value.trim();
+  if(!url) return;
+  await api('/api/sources', {method:'POST', body: JSON.stringify({name, url})});
+  closeModal(); loadSources();
+  toast('订阅源已添加');
+}
+
+// ============ 订阅口令 ============
+async function loadTokens(){
+  const r = await api('/api/tokens');
+  state.tokens = r.data || [];
+  renderTokens();
+}
+async function loadTokensQuiet(){ try{ await loadTokens(); }catch(e){} }
+function fmtExpire(ts){
+  if(!ts) return '永不';
+  const d = new Date(ts*1000);
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
+function renderTokens(){
+  const tbody = document.getElementById('tokenTbody');
+  document.getElementById('tokenCount').textContent = state.tokens.length + ' 个订阅';
+  document.getElementById('tokenEmpty').style.display = state.tokens.length ? 'none' : 'block';
+  const origin = location.origin;
+  tbody.innerHTML = state.tokens.map(t => {
+    const includeDesc = (t.includeAllNodes? '全部节点' : (t.nodeIds||[]).length+'个节点') + ' + ' + (t.includeAllSources? '全部订阅源' : (t.sourceIds||[]).length+'个订阅源');
+    const link = origin + '/sub/' + t.token;
+    return \`
+    <tr>
+      <td><span class="dot \${t.enabled!==false?'on':'off'}"></span></td>
+      <td>\${escapeHtml(t.name)}</td>
+      <td class="mono">\${includeDesc}</td>
+      <td class="mono">\${fmtExpire(t.meta && t.meta.expire)}</td>
+      <td>
+        <div class="copybox">
+          <input readonly value="\${link}" onclick="this.select()">
+          <button class="ghost" onclick="copyLink('\${link}')">复制</button>
+        </div>
+      </td>
+      <td class="row-actions">
+        <button class="ghost" onclick="editToken('\${t.token}')">编辑</button>
+        <button class="ghost danger" onclick="deleteToken('\${t.token}')">删除</button>
+      </td>
+    </tr>\`;
+  }).join('');
+}
+function copyLink(link){
+  navigator.clipboard.writeText(link).then(()=>toast('链接已复制'));
+}
+async function deleteToken(token){
+  if(!confirm('确认删除该订阅？')) return;
+  await api('/api/tokens/'+token, {method:'DELETE'});
+  loadTokens();
+}
+
+function nodeChecklistHtml(selectedIds){
+  if(!state.nodes.length) return '<div class="mono">暂无节点</div>';
+  return state.nodes.map(n=>\`<label><input type="checkbox" value="\${n.id}" \${selectedIds.includes(n.id)?'checked':''}> \${escapeHtml(n.name)} <span class="mono">(\${n.protocol})</span></label>\`).join('');
+}
+function sourceChecklistHtml(selectedIds){
+  if(!state.sources.length) return '<div class="mono">暂无订阅源</div>';
+  return state.sources.map(s=>\`<label><input type="checkbox" value="\${s.id}" \${selectedIds.includes(s.id)?'checked':''}> \${escapeHtml(s.name)}</label>\`).join('');
+}
+
+function tokenModalHtml(existing){
+  const t = existing || { name:'', includeAllNodes:true, includeAllSources:true, nodeIds:[], sourceIds:[], meta:{} };
+  const expireStr = t.meta && t.meta.expire ? new Date(t.meta.expire*1000).toISOString().slice(0,10) : '';
+  return \`
+    <h3>\${existing? '编辑订阅' : '创建订阅'}</h3>
+    <div class="field"><label>名称</label><input id="tkName" value="\${escapeHtml(t.name)}" placeholder="例如：我的手机"></div>
+    <div class="field">
+      <label><input type="checkbox" id="tkAllNodes" \${t.includeAllNodes?'checked':''}> 包含全部节点</label>
+      <div id="nodeCheckWrap" style="\${t.includeAllNodes?'display:none;':''}margin-top:6px;">
+        <div class="checklist">\${nodeChecklistHtml(t.nodeIds||[])}</div>
+      </div>
+    </div>
+    <div class="field">
+      <label><input type="checkbox" id="tkAllSources" \${t.includeAllSources?'checked':''}> 包含全部订阅源</label>
+      <div id="sourceCheckWrap" style="\${t.includeAllSources?'display:none;':''}margin-top:6px;">
+        <div class="checklist">\${sourceChecklistHtml(t.sourceIds||[])}</div>
+      </div>
+    </div>
+    <div class="field metagrid">
+      <div><label>总流量 (GB，0=不限)</label><input id="tkTotal" type="number" step="0.01" value="\${t.meta&&t.meta.total? (t.meta.total/1073741824).toFixed(2):''}"></div>
+      <div><label>到期日期（留空=永久）</label><input id="tkExpire" type="date" value="\${expireStr}"></div>
+      <div><label>已用上传 (GB)</label><input id="tkUpload" type="number" step="0.01" value="\${t.meta&&t.meta.upload? (t.meta.upload/1073741824).toFixed(2):''}"></div>
+      <div><label>已用下载 (GB)</label><input id="tkDownload" type="number" step="0.01" value="\${t.meta&&t.meta.download? (t.meta.download/1073741824).toFixed(2):''}"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="ghost" onclick="closeModal()">取消</button>
+      <button class="primary" onclick="submitToken(\${existing? \`'\${existing.token}'\` : 'null'})">保存</button>
+    </div>
+  \`;
+}
+document.getElementById('addTokenBtn').addEventListener('click', ()=>{
+  openModal(tokenModalHtml(null));
+  bindTokenModalEvents();
+});
+function editToken(token){
+  const t = state.tokens.find(x=>x.token===token);
+  openModal(tokenModalHtml(t));
+  bindTokenModalEvents();
+}
+function bindTokenModalEvents(){
+  document.getElementById('tkAllNodes').addEventListener('change', (e)=>{
+    document.getElementById('nodeCheckWrap').style.display = e.target.checked ? 'none' : '';
+  });
+  document.getElementById('tkAllSources').addEventListener('change', (e)=>{
+    document.getElementById('sourceCheckWrap').style.display = e.target.checked ? 'none' : '';
+  });
+}
+async function submitToken(existingToken){
+  const name = document.getElementById('tkName').value.trim() || '未命名订阅';
+  const includeAllNodes = document.getElementById('tkAllNodes').checked;
+  const includeAllSources = document.getElementById('tkAllSources').checked;
+  const nodeIds = includeAllNodes ? [] : Array.from(document.querySelectorAll('#nodeCheckWrap input:checked')).map(el=>el.value);
+  const sourceIds = includeAllSources ? [] : Array.from(document.querySelectorAll('#sourceCheckWrap input:checked')).map(el=>el.value);
+  const gb = (id)=> { const v = parseFloat(document.getElementById(id).value); return v ? Math.round(v*1073741824) : 0; };
+  const expireStr = document.getElementById('tkExpire').value;
+  const expire = expireStr ? Math.floor(new Date(expireStr+'T00:00:00Z').getTime()/1000) : 0;
+  const meta = { total: gb('tkTotal'), upload: gb('tkUpload'), download: gb('tkDownload'), expire };
+  const body = { name, includeAllNodes, includeAllSources, nodeIds, sourceIds, meta };
+  if(existingToken){
+    await api('/api/tokens/'+existingToken, {method:'PUT', body: JSON.stringify(body)});
+  } else {
+    await api('/api/tokens', {method:'POST', body: JSON.stringify(body)});
+  }
+  closeModal(); loadTokens();
+  toast('订阅已保存');
+}
+
+function escapeHtml(s){
+  return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+loadNodes(); loadSources(); loadTokens();
+</script>
+</body></html>`;
+
+// ============================== 主入口 ==============================
+
+export default {
+  async fetch(req, env) {
+    const url = new URL(req.url);
+    const path = url.pathname;
+
+    try {
+      if (path.startsWith('/api/')) {
+        return await handleApi(req, env, url);
+      }
+      if (path.startsWith('/sub/')) {
+        return await handleSub(req, env, url);
+      }
+      if (path === '/login') {
+        return new Response(LOGIN_HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      }
+      // 根路径与其他路径：需要登录才能看到控制台
+      const authed = await requireAuth(env.SUB_KV, req);
+      if (!authed) {
+        return Response.redirect(url.origin + '/login', 302);
+      }
+      return new Response(PORTAL_HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    } catch (err) {
+      return new Response('服务器错误: ' + err.message, { status: 500 });
+    }
+  },
+};
+
+// 导出内部函数供本地测试使用（Cloudflare Workers 环境下 export 不影响运行）
+export const __testables__ = {
+  parseNodeUri,
+  buildClashYaml,
+  buildRawSubscription,
+  yamlDump,
+  b64EncodeUtf8,
+  b64DecodeUtf8,
+};
