@@ -1,1 +1,2 @@
-# node-Cloudflare
+配置说明
+添加变量：ADMIN_PASSWORD=密码，ADMIN_USERNAME=用户名，KV变量=SUB_KV
