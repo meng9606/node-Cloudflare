@@ -1,12 +1,17 @@
 /**
  * Sub Aggregator - Cloudflare Worker
- * 聚合订阅生成器：支持单节点(vless/vmess/trojan/ss/hysteria2) + 远程订阅源实时聚合
+ * 聚合订阅生成器：支持单节点 + 远程订阅源实时聚合
  * 自动识别 Clash/OpenClash 与 Shadowrocket/V2ray 等客户端，分别输出 YAML / Base64
- * 数据存储：Cloudflare KV
+ * 数据存储：Cloudflare KV（绑定名 SUB_KV）
+ * 环境变量：ADMIN_USERNAME / ADMIN_PASSWORD
  *
- * 本版本新增：
- * 1. 已保存节点支持二次修改（编辑节点链接/名称）
- * 2. Clash 输出内置防 DNS 泄漏规则集（参考 ACL4SSR nodnsleak 规则）
+ * 支持的节点协议：
+ *   vless / vmess / trojan / ss(含 plugin) / ssr / hysteria / hysteria2(含端口跳跃)
+ *   tuic / anytls / wireguard / masque / mieru / socks5
+ *   naive、juicity：可保存并输出到 Base64 订阅，但 Clash 内核无对应类型，输出 YAML 时自动跳过
+ * 传输层：tcp / ws / grpc / h2 / httpupgrade / xhttp
+ *
+ * 导入支持：换行、\r\n、空格分隔、字面 "\n"、整段 Base64（含折行）
  */
 
 // ============================== 工具函数 ==============================
@@ -25,15 +30,15 @@ function b64DecodeUtf8(str) {
 }
 
 function fixB64(s) {
-  s = String(s).trim().replace(/-/g, '+').replace(/_/g, '/');
+  s = String(s).replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
   while (s.length % 4) s += '=';
   return s;
 }
 
 function looksLikeBase64(s) {
-  const t = s.trim();
+  const t = String(s).replace(/\s/g, '');
   if (t.length < 8) return false;
-  return /^[A-Za-z0-9+/_-]+={0,2}$/.test(t.replace(/\s/g, ''));
+  return /^[A-Za-z0-9+/_-]+={0,2}$/.test(t);
 }
 
 function splitFirst(s, sep) {
@@ -48,6 +53,22 @@ function splitLast(s, sep) {
   return [s.slice(0, i), s.slice(i + 1)];
 }
 
+function safeDecode(s) {
+  try {
+    return decodeURIComponent(s);
+  } catch (e) {
+    return s;
+  }
+}
+
+function hostOf(u) {
+  return u.hostname.replace(/^\[|\]$/g, '');
+}
+
+function listOf(s) {
+  return s ? String(s).split(',').map((x) => x.trim()).filter(Boolean) : [];
+}
+
 function uid(len = 12) {
   const bytes = crypto.getRandomValues(new Uint8Array(len));
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('').slice(0, len);
@@ -57,12 +78,6 @@ function randomToken(len = 28) {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   const bytes = crypto.getRandomValues(new Uint8Array(len));
   return Array.from(bytes, (b) => chars[b % chars.length]).join('');
-}
-
-async function sha256Hex(str) {
-  const data = new TextEncoder().encode(str);
-  const digest = await crypto.subtle.digest('SHA-256', data);
-  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 function jsonResponse(obj, status = 200, extraHeaders = {}) {
@@ -83,6 +98,68 @@ function parseCookies(req) {
   return out;
 }
 
+// ---- 协议 scheme 表 ----
+// 注意：不包含裸 http/https，否则粘贴的订阅 URL 会被误认为节点
+const SCHEME_MAP = {
+  vless: 'vless',
+  vmess: 'vmess',
+  trojan: 'trojan',
+  ss: 'ss',
+  ssr: 'ssr',
+  hysteria2: 'hysteria2',
+  hy2: 'hysteria2',
+  hysteria: 'hysteria',
+  hy: 'hysteria',
+  tuic: 'tuic',
+  anytls: 'anytls',
+  wireguard: 'wireguard',
+  wg: 'wireguard',
+  masque: 'masque',
+  mierus: 'mieru',
+  mieru: 'mieru',
+  socks5: 'socks5',
+  socks5h: 'socks5',
+  socks: 'socks5',
+  'naive+https': 'naive',
+  'naive+quic': 'naive',
+  juicity: 'juicity',
+};
+const NODE_SCHEMES = Object.keys(SCHEME_MAP);
+
+// Clash 内核无法表示的协议（仅在 Base64 订阅中输出）
+const CLASH_UNSUPPORTED = new Set(['naive', 'juicity']);
+
+// 从任意文本中提取节点链接：换行 / \r\n / 空格分隔 / 字面 "\n" / 整段 Base64（含折行）
+function extractNodeLinks(text) {
+  const prep = (t) => String(t || '').replace(/\\n/g, '\n').replace(/\r\n?/g, '\n').trim();
+  const alt = NODE_SCHEMES.map((s) => s.replace(/[+.]/g, '\\$&')).join('|');
+  const splitRe = new RegExp('\\s+(?=(?:' + alt + ')://)', 'i');
+  const startRe = new RegExp('^(?:' + alt + ')://', 'i');
+  const pick = (t) => {
+    const out = [];
+    for (const line of t.split('\n')) {
+      for (const seg of line.trim().split(splitRe)) {
+        const s = seg.trim();
+        if (startRe.test(s)) out.push(s);
+      }
+    }
+    return out;
+  };
+  const t = prep(text);
+  let links = pick(t);
+  if (!links.length) {
+    const compact = t.replace(/\s+/g, '');
+    if (looksLikeBase64(compact)) {
+      try {
+        links = pick(prep(b64DecodeUtf8(compact)));
+      } catch (e) {
+        /* ignore */
+      }
+    }
+  }
+  return links;
+}
+
 // ============================== YAML 序列化（受控子集） ==============================
 
 function yamlScalar(v) {
@@ -91,9 +168,8 @@ function yamlScalar(v) {
   if (typeof v === 'boolean') return v ? 'true' : 'false';
   let s = String(v);
   if (s === '') return "''";
-  // 需要加引号的情况：包含特殊字符、看起来像数字/布尔、以特殊符号开头
   const needsQuote =
-    /[:#\[\]{}",\n]/.test(s) ||
+    /[:#\[\]{}",\r\n]/.test(s) ||
     /^[\s]/.test(s) ||
     /[\s]$/.test(s) ||
     /^(true|false|null|~|yes|no)$/i.test(s) ||
@@ -108,12 +184,11 @@ function yamlScalar(v) {
     s.startsWith('@') ||
     s.startsWith('`');
   if (needsQuote) {
-    return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '\\r').replace(/\n/g, '\\n')}"`;
   }
   return s;
 }
 
-// value: object | array | scalar. 输出不带结尾多余空行的 YAML 片段（每行已含末尾换行）
 function yamlDump(value, indent = 0) {
   const pad = '  '.repeat(indent);
   if (Array.isArray(value)) {
@@ -125,7 +200,6 @@ function yamlDump(value, indent = 0) {
         const lines = inner.split('\n').filter((l) => l.length > 0);
         lines.forEach((line, i) => {
           if (i === 0) {
-            // 把第一行的缩进替换为 "- "
             out += pad + '- ' + line.slice(pad.length + 2) + '\n';
           } else {
             out += line + '\n';
@@ -155,41 +229,50 @@ function yamlDump(value, indent = 0) {
 }
 
 // ============================== 节点 URI 解析 ==============================
-// 统一输出结构（normalized node）供 Clash 转换与展示使用；raw 原文用于 base64/raw 输出。
 
 function safeUrlParse(raw) {
-  // vless/vmess/trojan/hysteria2 等非标准 scheme，WHATWG URL 仍可解析 authority
   return new URL(raw);
+}
+
+// wireguard / masque 的私钥可能含未编码的 / + =，先统一编码再交给 URL 解析
+function encodeKeyUserinfo(raw) {
+  return raw.replace(/^([a-z0-9]+):\/\/([^@]+)@/i, (m, scheme, key) =>
+    scheme + '://' + encodeURIComponent(safeDecode(key)) + '@'
+  );
 }
 
 function parseVless(raw) {
   const u = safeUrlParse(raw);
   const p = u.searchParams;
-  const name = decodeURIComponent(u.hash.replace(/^#/, '')) || u.hostname;
-  const security = p.get('security') || 'none';
+  const host = hostOf(u);
+  const name = safeDecode(u.hash.replace(/^#/, '')) || host;
+  let network = (p.get('type') || 'tcp').toLowerCase();
+  if (network === 'raw') network = 'tcp';
   return {
     protocol: 'vless',
     name,
-    server: u.hostname,
+    server: host,
     port: parseInt(u.port, 10),
-    uuid: decodeURIComponent(u.username),
-    security,
-    sni: p.get('sni') || p.get('host') || u.hostname,
-    network: p.get('type') || 'tcp',
-    wsPath: p.get('path') ? decodeURIComponent(p.get('path')) : '/',
-    wsHost: p.get('host') || p.get('sni') || u.hostname,
+    uuid: safeDecode(u.username),
+    security: p.get('security') || 'none',
+    sni: p.get('sni') || p.get('host') || host,
+    network,
+    wsPath: p.get('path') ? safeDecode(p.get('path')) : '/',
+    wsHost: p.get('host') || p.get('sni') || host,
     grpcServiceName: p.get('serviceName') || p.get('path') || '',
+    xhttpMode: p.get('mode') || '',
     flow: p.get('flow') || '',
     fp: p.get('fp') || '',
     pbk: p.get('pbk') || '',
     sid: p.get('sid') || '',
-    alpn: p.get('alpn') || '',
+    alpn: p.get('alpn') ? safeDecode(p.get('alpn')) : '',
+    encryption: p.get('encryption') || '',
     insecure: p.get('insecure') === '1' || p.get('allowInsecure') === '1',
   };
 }
 
 function parseVmess(raw) {
-  const b64 = raw.replace(/^vmess:\/\//, '');
+  const b64 = raw.replace(/^vmess:\/\//i, '');
   const json = JSON.parse(b64DecodeUtf8(b64));
   const tls = String(json.tls || '').toLowerCase();
   return {
@@ -206,52 +289,63 @@ function parseVmess(raw) {
     wsPath: json.path || '/',
     wsHost: json.host || json.add,
     grpcServiceName: json.path || '',
-    insecure: false,
+    alpn: json.alpn || '',
+    fp: json.fp || '',
+    insecure: json.allowInsecure === true || json.allowInsecure === 1 || json.allowInsecure === '1',
   };
 }
 
 function parseTrojan(raw) {
   const u = safeUrlParse(raw);
   const p = u.searchParams;
-  const name = decodeURIComponent(u.hash.replace(/^#/, '')) || u.hostname;
+  const host = hostOf(u);
+  const name = safeDecode(u.hash.replace(/^#/, '')) || host;
   return {
     protocol: 'trojan',
     name,
-    server: u.hostname,
+    server: host,
     port: parseInt(u.port, 10),
-    password: decodeURIComponent(u.username),
-    sni: p.get('sni') || p.get('peer') || u.hostname,
+    password: safeDecode(u.username),
+    sni: p.get('sni') || p.get('peer') || host,
     network: p.get('type') || 'tcp',
-    wsPath: p.get('path') ? decodeURIComponent(p.get('path')) : '/',
-    wsHost: p.get('host') || u.hostname,
+    wsPath: p.get('path') ? safeDecode(p.get('path')) : '/',
+    wsHost: p.get('host') || host,
     grpcServiceName: p.get('serviceName') || '',
+    xhttpMode: p.get('mode') || '',
+    alpn: p.get('alpn') ? safeDecode(p.get('alpn')) : '',
+    fp: p.get('fp') || '',
     insecure: p.get('allowInsecure') === '1' || p.get('insecure') === '1',
   };
 }
 
 function parseSS(raw) {
-  let rest = raw.replace(/^ss:\/\//, '');
+  let rest = raw.replace(/^ss:\/\//i, '');
   let name = '';
   const hashIdx = rest.indexOf('#');
   if (hashIdx >= 0) {
-    name = decodeURIComponent(rest.slice(hashIdx + 1));
+    name = safeDecode(rest.slice(hashIdx + 1));
     rest = rest.slice(0, hashIdx);
   }
+  let query = '';
   const qIdx = rest.indexOf('?');
-  if (qIdx >= 0) rest = rest.slice(0, qIdx);
+  if (qIdx >= 0) {
+    query = rest.slice(qIdx + 1);
+    rest = rest.slice(0, qIdx);
+  }
+  const plugin = query ? new URLSearchParams(query).get('plugin') || '' : '';
 
   let method, password, server, port;
   const atIdx = rest.lastIndexOf('@');
   if (atIdx >= 0) {
     // SIP002: base64(method:password)@host:port
     const userinfo = rest.slice(0, atIdx);
-    const hostport = rest.slice(atIdx + 1);
+    const hostport = rest.slice(atIdx + 1).replace(/\/+$/, '');
     let decoded;
     try {
       decoded = b64DecodeUtf8(userinfo);
       if (!decoded.includes(':')) throw new Error('not method:password');
     } catch (e) {
-      decoded = decodeURIComponent(userinfo);
+      decoded = safeDecode(userinfo);
     }
     [method, password] = splitFirst(decoded, ':');
     [server, port] = splitLast(hostport, ':');
@@ -264,6 +358,7 @@ function parseSS(raw) {
     [method, password] = splitFirst(userinfo, ':');
     [server, port] = splitLast(hostport, ':');
   }
+  server = String(server).replace(/^\[|\]$/g, '');
   return {
     protocol: 'ss',
     name: name || server,
@@ -271,46 +366,295 @@ function parseSS(raw) {
     port: parseInt(port, 10),
     method,
     password,
+    plugin,
+  };
+}
+
+function parseSSR(raw) {
+  const body = raw.replace(/^ssr:\/\//i, '').split('#')[0];
+  const decoded = b64DecodeUtf8(body);
+  const qi = decoded.indexOf('/?');
+  const main = qi >= 0 ? decoded.slice(0, qi) : decoded;
+  const q = {};
+  if (qi >= 0) {
+    decoded
+      .slice(qi + 2)
+      .split('&')
+      .forEach((kv) => {
+        const i = kv.indexOf('=');
+        if (i > 0) q[kv.slice(0, i)] = kv.slice(i + 1);
+      });
+  }
+  const parts = main.split(':');
+  if (parts.length < 6) throw new Error('SSR 格式不正确');
+  const passB64 = parts.pop();
+  const obfs = parts.pop();
+  const method = parts.pop();
+  const protocol = parts.pop();
+  const port = parts.pop();
+  const server = parts.join(':').replace(/^\[|\]$/g, '');
+  const dec = (k) => {
+    if (!q[k]) return '';
+    try {
+      return b64DecodeUtf8(q[k]);
+    } catch (e) {
+      return '';
+    }
+  };
+  return {
+    protocol: 'ssr',
+    name: dec('remarks') || server,
+    server,
+    port: parseInt(port, 10),
+    password: b64DecodeUtf8(passB64),
+    method,
+    ssrProtocol: protocol,
+    obfs,
+    obfsParam: dec('obfsparam'),
+    protocolParam: dec('protoparam'),
   };
 }
 
 function parseHysteria2(raw) {
-  const normalized = raw.replace(/^hy2:\/\//, 'hysteria2://');
+  const normalized = raw.replace(/^hy2:\/\//i, 'hysteria2://');
   const u = safeUrlParse(normalized);
   const p = u.searchParams;
-  const name = decodeURIComponent(u.hash.replace(/^#/, '')) || u.hostname;
+  const host = hostOf(u);
+  const name = safeDecode(u.hash.replace(/^#/, '')) || host;
   return {
     protocol: 'hysteria2',
     name,
-    server: u.hostname,
+    server: host,
     port: parseInt(u.port, 10) || 443,
-    password: decodeURIComponent(u.username) + (u.password ? ':' + decodeURIComponent(u.password) : ''),
-    sni: p.get('sni') || p.get('peer') || u.hostname,
-    insecure: p.get('insecure') === '1',
+    password: safeDecode(u.username) + (u.password ? ':' + safeDecode(u.password) : ''),
+    sni: p.get('sni') || p.get('peer') || host,
+    insecure: p.get('insecure') === '1' || p.get('allowInsecure') === '1',
     obfs: p.get('obfs') || '',
     obfsPassword: p.get('obfs-password') || '',
+    mport: p.get('mport') || '',
+    alpn: p.get('alpn') ? safeDecode(p.get('alpn')) : '',
+  };
+}
+
+function parseHysteria(raw) {
+  const normalized = raw.replace(/^hy:\/\//i, 'hysteria://');
+  const u = safeUrlParse(normalized);
+  const p = u.searchParams;
+  const host = hostOf(u);
+  const name = safeDecode(u.hash.replace(/^#/, '')) || host;
+  return {
+    protocol: 'hysteria',
+    name,
+    server: host,
+    port: parseInt(u.port, 10) || 443,
+    auth: p.get('auth') || safeDecode(u.username) || '',
+    sni: p.get('peer') || p.get('sni') || host,
+    insecure: p.get('insecure') === '1' || p.get('allowInsecure') === '1',
+    up: p.get('upmbps') || p.get('up') || '100',
+    down: p.get('downmbps') || p.get('down') || '100',
+    alpn: p.get('alpn') ? safeDecode(p.get('alpn')) : '',
+    hyProtocol: p.get('protocol') || '',
+    obfs: p.get('obfs') || '',
+    obfsParam: p.get('obfsParam') || p.get('obfs-password') || '',
+  };
+}
+
+function parseTuic(raw) {
+  const u = safeUrlParse(raw);
+  const p = u.searchParams;
+  const host = hostOf(u);
+  const name = safeDecode(u.hash.replace(/^#/, '')) || host;
+  return {
+    protocol: 'tuic',
+    name,
+    server: host,
+    port: parseInt(u.port, 10) || 443,
+    uuid: safeDecode(u.username),
+    password: safeDecode(u.password),
+    sni: p.get('sni') || host,
+    congestion: p.get('congestion_control') || p.get('congestion-controller') || 'bbr',
+    udpRelayMode: p.get('udp_relay_mode') || p.get('udp-relay-mode') || 'native',
+    alpn: p.get('alpn') ? safeDecode(p.get('alpn')) : '',
+    disableSni: p.get('disable_sni') === '1',
+    insecure: ['allow_insecure', 'allowInsecure', 'insecure'].some((k) => p.get(k) === '1'),
+  };
+}
+
+function parseAnytls(raw) {
+  const u = safeUrlParse(raw);
+  const p = u.searchParams;
+  const host = hostOf(u);
+  const name = safeDecode(u.hash.replace(/^#/, '')) || host;
+  return {
+    protocol: 'anytls',
+    name,
+    server: host,
+    port: parseInt(u.port, 10) || 443,
+    password: safeDecode(u.username) + (u.password ? ':' + safeDecode(u.password) : ''),
+    sni: p.get('sni') || p.get('peer') || host,
+    alpn: p.get('alpn') ? safeDecode(p.get('alpn')) : '',
+    fp: p.get('fp') || '',
+    insecure: p.get('insecure') === '1' || p.get('allowInsecure') === '1',
+  };
+}
+
+function parseWireguard(raw) {
+  const u = safeUrlParse(encodeKeyUserinfo(raw));
+  const p = u.searchParams;
+  const host = hostOf(u);
+  const name = safeDecode(u.hash.replace(/^#/, '')) || host;
+  let ip = '';
+  let ipv6 = '';
+  listOf(p.get('address') || p.get('ip')).forEach((a) => {
+    const addr = a.replace(/\/\d+$/, '');
+    if (addr.includes(':')) ipv6 = ipv6 || addr;
+    else ip = ip || addr;
+  });
+  const reserved = listOf(p.get('reserved'))
+    .map(Number)
+    .filter((x) => !Number.isNaN(x));
+  return {
+    protocol: 'wireguard',
+    name,
+    server: host,
+    port: parseInt(u.port, 10) || 51820,
+    privateKey: safeDecode(u.username),
+    publicKey: p.get('publickey') || p.get('public-key') || p.get('peer_public_key') || '',
+    presharedKey: p.get('presharedkey') || p.get('pre-shared-key') || '',
+    ip,
+    ipv6,
+    reserved,
+    mtu: parseInt(p.get('mtu'), 10) || 0,
+  };
+}
+
+// masque://私钥@host:port?public-key=..&ip=..&ipv6=..&sni=..&mtu=..&uri=..#名称
+function parseMasque(raw) {
+  const u = safeUrlParse(encodeKeyUserinfo(raw));
+  const p = u.searchParams;
+  const host = hostOf(u);
+  const name = safeDecode(u.hash.replace(/^#/, '')) || host;
+  return {
+    protocol: 'masque',
+    name,
+    server: host,
+    port: parseInt(u.port, 10) || 443,
+    privateKey: safeDecode(u.username),
+    publicKey: p.get('public-key') || p.get('publickey') || '',
+    ip: p.get('ip') || '',
+    ipv6: p.get('ipv6') || '',
+    uri: p.get('uri') || '',
+    sni: p.get('sni') || '',
+    mtu: parseInt(p.get('mtu'), 10) || 0,
+  };
+}
+
+// mierus://用户:密码@host?port=2999&protocol=TCP&multiplexing=MULTIPLEXING_LOW&profile=名称#名称
+// port 也可以是端口段，如 2090-2099（可重复出现，取第一个）
+function parseMieru(raw) {
+  const normalized = raw.replace(/^mieru:\/\//i, 'mierus://');
+  const u = safeUrlParse(normalized);
+  const p = u.searchParams;
+  const host = hostOf(u);
+  const portStr = p.get('port') || u.port || '';
+  const first = portStr.split(/[,]/)[0];
+  const portNum = parseInt(first, 10);
+  const isRange = /^\d+-\d+$/.test(first);
+  return {
+    protocol: 'mieru',
+    name: safeDecode(u.hash.replace(/^#/, '')) || p.get('profile') || host,
+    server: host,
+    port: portNum,
+    portRange: isRange ? first : '',
+    username: safeDecode(u.username),
+    password: safeDecode(u.password),
+    transport: (p.get('protocol') || 'TCP').toUpperCase(),
+    multiplexing: p.get('multiplexing') || '',
+  };
+}
+
+// socks5://user:pass@host:port  或  socks5://base64(user:pass)@host:port
+function parseSocks(raw) {
+  const u = safeUrlParse(raw);
+  const host = hostOf(u);
+  let user = safeDecode(u.username);
+  let pass = safeDecode(u.password);
+  if (user && !pass) {
+    try {
+      const d = b64DecodeUtf8(user);
+      if (d.includes(':')) [user, pass] = splitFirst(d, ':');
+    } catch (e) {
+      /* 不是 base64 */
+    }
+  }
+  return {
+    protocol: 'socks5',
+    name: safeDecode(u.hash.replace(/^#/, '')) || host,
+    server: host,
+    port: parseInt(u.port, 10) || 1080,
+    username: user,
+    password: pass,
+  };
+}
+
+// naive+https://用户:密码@host:port?padding=true#名称
+function parseNaive(raw) {
+  const u = safeUrlParse(raw);
+  const host = hostOf(u);
+  return {
+    protocol: 'naive',
+    name: safeDecode(u.hash.replace(/^#/, '')) || host,
+    server: host,
+    port: parseInt(u.port, 10) || 443,
+    username: safeDecode(u.username),
+    password: safeDecode(u.password),
+  };
+}
+
+// juicity://uuid:password@host:port?congestion_control=bbr&sni=..&allow_insecure=1#名称
+function parseJuicity(raw) {
+  const u = safeUrlParse(raw);
+  const p = u.searchParams;
+  const host = hostOf(u);
+  return {
+    protocol: 'juicity',
+    name: safeDecode(u.hash.replace(/^#/, '')) || host,
+    server: host,
+    port: parseInt(u.port, 10) || 443,
+    uuid: safeDecode(u.username),
+    password: safeDecode(u.password),
+    sni: p.get('sni') || host,
   };
 }
 
 function detectProtocol(raw) {
-  const m = raw.trim().match(/^([a-z0-9]+):\/\//i);
+  const m = raw.trim().match(/^([a-z0-9+.-]+):\/\//i);
   if (!m) return null;
-  const scheme = m[1].toLowerCase();
-  if (scheme === 'hy2') return 'hysteria2';
-  if (['vless', 'vmess', 'trojan', 'ss', 'hysteria2'].includes(scheme)) return scheme;
-  return null;
+  return SCHEME_MAP[m[1].toLowerCase()] || null;
 }
 
 function parseNodeUri(raw) {
   raw = raw.trim();
   const protocol = detectProtocol(raw);
   if (!protocol) throw new Error('无法识别的协议: ' + raw.slice(0, 30));
-  let parsed;
-  if (protocol === 'vless') parsed = parseVless(raw);
-  else if (protocol === 'vmess') parsed = parseVmess(raw);
-  else if (protocol === 'trojan') parsed = parseTrojan(raw);
-  else if (protocol === 'ss') parsed = parseSS(raw);
-  else if (protocol === 'hysteria2') parsed = parseHysteria2(raw);
+  const parsers = {
+    vless: parseVless,
+    vmess: parseVmess,
+    trojan: parseTrojan,
+    ss: parseSS,
+    ssr: parseSSR,
+    hysteria2: parseHysteria2,
+    hysteria: parseHysteria,
+    tuic: parseTuic,
+    anytls: parseAnytls,
+    wireguard: parseWireguard,
+    masque: parseMasque,
+    mieru: parseMieru,
+    socks5: parseSocks,
+    naive: parseNaive,
+    juicity: parseJuicity,
+  };
+  const parsed = parsers[protocol](raw);
   if (!parsed.server || !parsed.port) throw new Error('缺少 server/port: ' + raw.slice(0, 30));
   parsed.raw = raw;
   return parsed;
@@ -329,61 +673,180 @@ function uniqueName(base, usedNames) {
   return name;
 }
 
+function applyTransport(proxy, n) {
+  const net = n.network;
+  if (net === 'ws') {
+    proxy['ws-opts'] = { path: n.wsPath, headers: { Host: n.wsHost } };
+  } else if (net === 'httpupgrade') {
+    proxy.network = 'ws';
+    proxy['ws-opts'] = { path: n.wsPath, headers: { Host: n.wsHost }, 'v2ray-http-upgrade': true };
+  } else if (net === 'grpc') {
+    proxy['grpc-opts'] = { 'grpc-service-name': n.grpcServiceName };
+  } else if (net === 'h2') {
+    proxy['h2-opts'] = { host: [n.wsHost], path: n.wsPath };
+  } else if (net === 'xhttp') {
+    proxy['xhttp-opts'] = { path: n.wsPath, host: n.wsHost, mode: n.xhttpMode || 'auto' };
+  }
+}
+
 function nodeToClashProxy(n) {
   const proxy = { name: n.name, server: n.server, port: n.port, udp: true };
-  if (n.protocol === 'vless') {
-    proxy.type = 'vless';
-    proxy.uuid = n.uuid;
-    proxy.tls = n.security === 'tls' || n.security === 'reality';
-    proxy.network = n.network;
-    proxy['skip-cert-verify'] = !!n.insecure;
-    if (proxy.tls) proxy.servername = n.sni;
-    if (n.flow) proxy.flow = n.flow;
-    if (n.fp) proxy['client-fingerprint'] = n.fp;
-    if (n.security === 'reality') {
-      proxy['reality-opts'] = { 'public-key': n.pbk, 'short-id': n.sid };
+  const alpn = listOf(n.alpn);
+  switch (n.protocol) {
+    case 'vless':
+      proxy.type = 'vless';
+      proxy.uuid = n.uuid;
+      proxy.tls = n.security === 'tls' || n.security === 'reality';
+      proxy.network = n.network === 'httpupgrade' ? 'ws' : n.network;
+      proxy['skip-cert-verify'] = !!n.insecure;
+      if (proxy.tls) proxy.servername = n.sni;
+      if (proxy.tls && alpn.length) proxy.alpn = alpn;
+      if (n.flow) proxy.flow = n.flow;
+      if (n.fp) proxy['client-fingerprint'] = n.fp;
+      if (n.encryption && n.encryption !== 'none') proxy.encryption = n.encryption;
+      if (n.security === 'reality') {
+        proxy['reality-opts'] = { 'public-key': n.pbk, 'short-id': n.sid };
+      }
+      applyTransport(proxy, n);
+      break;
+    case 'vmess':
+      proxy.type = 'vmess';
+      proxy.uuid = n.uuid;
+      proxy.alterId = n.aid;
+      proxy.cipher = n.cipher;
+      proxy.tls = !!n.tlsEnabled;
+      proxy.network = n.network === 'httpupgrade' ? 'ws' : n.network;
+      if (proxy.tls) {
+        proxy.servername = n.sni;
+        proxy['skip-cert-verify'] = !!n.insecure;
+        if (alpn.length) proxy.alpn = alpn;
+        if (n.fp) proxy['client-fingerprint'] = n.fp;
+      }
+      applyTransport(proxy, n);
+      break;
+    case 'trojan':
+      proxy.type = 'trojan';
+      proxy.password = n.password;
+      proxy.sni = n.sni;
+      proxy['skip-cert-verify'] = !!n.insecure;
+      if (alpn.length) proxy.alpn = alpn;
+      if (n.fp) proxy['client-fingerprint'] = n.fp;
+      if (n.network && n.network !== 'tcp') {
+        proxy.network = n.network === 'httpupgrade' ? 'ws' : n.network;
+        applyTransport(proxy, n);
+      }
+      break;
+    case 'ss': {
+      proxy.type = 'ss';
+      proxy.cipher = n.method;
+      proxy.password = n.password;
+      if (n.plugin) {
+        const [pn, ...opts] = n.plugin.split(';');
+        const o = {};
+        opts.forEach((x) => {
+          const [k, v] = splitFirst(x, '=');
+          if (k) o[k] = v;
+        });
+        if (/obfs/.test(pn)) {
+          proxy.plugin = 'obfs';
+          proxy['plugin-opts'] = { mode: o.obfs || 'http', host: o['obfs-host'] || '' };
+        } else if (pn.includes('v2ray-plugin')) {
+          proxy.plugin = 'v2ray-plugin';
+          proxy['plugin-opts'] = {
+            mode: 'websocket',
+            tls: 'tls' in o,
+            host: o.host || '',
+            path: o.path || '/',
+            mux: 'mux' in o,
+          };
+        }
+      }
+      break;
     }
-    if (n.network === 'ws') {
-      proxy['ws-opts'] = { path: n.wsPath, headers: { Host: n.wsHost } };
-    } else if (n.network === 'grpc') {
-      proxy['grpc-opts'] = { 'grpc-service-name': n.grpcServiceName };
-    }
-  } else if (n.protocol === 'vmess') {
-    proxy.type = 'vmess';
-    proxy.uuid = n.uuid;
-    proxy.alterId = n.aid;
-    proxy.cipher = n.cipher;
-    proxy.tls = !!n.tlsEnabled;
-    proxy.network = n.network;
-    if (proxy.tls) proxy.servername = n.sni;
-    if (n.network === 'ws') {
-      proxy['ws-opts'] = { path: n.wsPath, headers: { Host: n.wsHost } };
-    } else if (n.network === 'grpc') {
-      proxy['grpc-opts'] = { 'grpc-service-name': n.grpcServiceName };
-    }
-  } else if (n.protocol === 'trojan') {
-    proxy.type = 'trojan';
-    proxy.password = n.password;
-    proxy.sni = n.sni;
-    proxy['skip-cert-verify'] = !!n.insecure;
-    if (n.network && n.network !== 'tcp') {
-      proxy.network = n.network;
-      if (n.network === 'ws') proxy['ws-opts'] = { path: n.wsPath, headers: { Host: n.wsHost } };
-      if (n.network === 'grpc') proxy['grpc-opts'] = { 'grpc-service-name': n.grpcServiceName };
-    }
-  } else if (n.protocol === 'ss') {
-    proxy.type = 'ss';
-    proxy.cipher = n.method;
-    proxy.password = n.password;
-  } else if (n.protocol === 'hysteria2') {
-    proxy.type = 'hysteria2';
-    proxy.password = n.password;
-    proxy.sni = n.sni;
-    proxy['skip-cert-verify'] = !!n.insecure;
-    if (n.obfs) {
+    case 'ssr':
+      proxy.type = 'ssr';
+      proxy.cipher = n.method;
+      proxy.password = n.password;
       proxy.obfs = n.obfs;
-      proxy['obfs-password'] = n.obfsPassword;
-    }
+      proxy.protocol = n.ssrProtocol;
+      if (n.obfsParam) proxy['obfs-param'] = n.obfsParam;
+      if (n.protocolParam) proxy['protocol-param'] = n.protocolParam;
+      break;
+    case 'hysteria2':
+      proxy.type = 'hysteria2';
+      proxy.password = n.password;
+      proxy.sni = n.sni;
+      proxy['skip-cert-verify'] = !!n.insecure;
+      if (alpn.length) proxy.alpn = alpn;
+      if (n.mport) proxy.ports = n.mport;
+      if (n.obfs) {
+        proxy.obfs = n.obfs;
+        proxy['obfs-password'] = n.obfsPassword;
+      }
+      break;
+    case 'hysteria':
+      proxy.type = 'hysteria';
+      proxy['auth-str'] = n.auth;
+      proxy.sni = n.sni;
+      proxy['skip-cert-verify'] = !!n.insecure;
+      proxy.up = /^\d+$/.test(n.up) ? n.up + ' Mbps' : n.up;
+      proxy.down = /^\d+$/.test(n.down) ? n.down + ' Mbps' : n.down;
+      if (alpn.length) proxy.alpn = alpn;
+      if (n.hyProtocol) proxy.protocol = n.hyProtocol;
+      if (n.obfs) proxy.obfs = n.obfsParam || n.obfs;
+      break;
+    case 'tuic':
+      proxy.type = 'tuic';
+      proxy.uuid = n.uuid;
+      proxy.password = n.password;
+      proxy.sni = n.sni;
+      proxy['congestion-controller'] = n.congestion;
+      proxy['udp-relay-mode'] = n.udpRelayMode;
+      proxy['skip-cert-verify'] = !!n.insecure;
+      if (alpn.length) proxy.alpn = alpn;
+      if (n.disableSni) proxy['disable-sni'] = true;
+      break;
+    case 'anytls':
+      proxy.type = 'anytls';
+      proxy.password = n.password;
+      proxy.sni = n.sni;
+      proxy['skip-cert-verify'] = !!n.insecure;
+      if (alpn.length) proxy.alpn = alpn;
+      if (n.fp) proxy['client-fingerprint'] = n.fp;
+      break;
+    case 'wireguard':
+      proxy.type = 'wireguard';
+      proxy['private-key'] = n.privateKey;
+      proxy['public-key'] = n.publicKey;
+      if (n.ip) proxy.ip = n.ip;
+      if (n.ipv6) proxy.ipv6 = n.ipv6;
+      if (n.presharedKey) proxy['pre-shared-key'] = n.presharedKey;
+      if (n.reserved && n.reserved.length) proxy.reserved = n.reserved;
+      if (n.mtu) proxy.mtu = n.mtu;
+      break;
+    case 'masque':
+      proxy.type = 'masque';
+      proxy['private-key'] = n.privateKey;
+      proxy['public-key'] = n.publicKey;
+      if (n.ip) proxy.ip = n.ip;
+      if (n.ipv6) proxy.ipv6 = n.ipv6;
+      if (n.uri) proxy.uri = n.uri;
+      if (n.sni) proxy.sni = n.sni;
+      if (n.mtu) proxy.mtu = n.mtu;
+      break;
+    case 'mieru':
+      proxy.type = 'mieru';
+      proxy.transport = n.transport || 'TCP';
+      proxy.username = n.username;
+      proxy.password = n.password;
+      if (n.portRange) proxy['port-range'] = n.portRange;
+      if (n.multiplexing) proxy.multiplexing = n.multiplexing;
+      break;
+    case 'socks5':
+      proxy.type = 'socks5';
+      if (n.username) proxy.username = n.username;
+      if (n.password) proxy.password = n.password;
+      break;
   }
   return proxy;
 }
@@ -438,8 +901,7 @@ async function getSession(kv, req) {
   const cookies = parseCookies(req);
   const sid = cookies['sid'];
   if (!sid) return null;
-  const s = await kv.get('session:' + sid, 'json');
-  return s;
+  return await kv.get('session:' + sid, 'json');
 }
 
 async function requireAuth(kv, req) {
@@ -458,24 +920,12 @@ function clearCookieHeader() {
 // ============================== 订阅聚合 ==============================
 
 async function fetchSourceNodes(url) {
-  const res = await fetch(url, { headers: { 'User-Agent': 'ClashMetaForAndroid/2.10' } });
+  // 使用 v2rayN 的 UA：多数机场会返回 Base64 链接列表，而不是 Clash YAML
+  const res = await fetch(url, { headers: { 'User-Agent': 'v2rayN/7.0' } });
   if (!res.ok) throw new Error('源站请求失败: HTTP ' + res.status);
-  let text = await res.text();
-  text = text.trim();
-  // 尝试整体 base64 解码
-  if (looksLikeBase64(text) && !/^(vless|vmess|trojan|ss|hysteria2|hy2):\/\//im.test(text)) {
-    try {
-      const decoded = b64DecodeUtf8(text);
-      if (/:\/\//.test(decoded)) text = decoded;
-    } catch (e) {
-      /* 保持原文，可能本身就是明文 */
-    }
-  }
-  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const text = await res.text();
   const nodes = [];
-  for (const line of lines) {
-    const proto = detectProtocol(line);
-    if (!proto) continue;
+  for (const line of extractNodeLinks(text)) {
     try {
       nodes.push(parseNodeUri(line));
     } catch (e) {
@@ -499,7 +949,9 @@ async function collectTokenNodes(kv, tokenRecord) {
   const manualParsed = [];
   for (const n of manualNodes) {
     try {
-      manualParsed.push(parseNodeUri(n.raw));
+      const parsed = parseNodeUri(n.raw);
+      if (n.name) parsed.name = n.name; // 使用控制台中保存/修改后的名称
+      manualParsed.push(parsed);
     } catch (e) {
       /* 忽略损坏节点 */
     }
@@ -519,11 +971,16 @@ async function collectTokenNodes(kv, tokenRecord) {
     if (r.status === 'fulfilled') remoteParsed.push(...r.value);
   });
 
-  // 去重：以 protocol+server+port+uuid/password 为 key
+  // 去重
   const seen = new Set();
   const merged = [];
   for (const n of [...manualParsed, ...remoteParsed]) {
-    const key = [n.protocol, n.server, n.port, n.uuid || n.password || ''].join('|');
+    const key = [
+      n.protocol,
+      n.server,
+      n.port,
+      n.uuid || n.password || n.privateKey || n.auth || n.username || '',
+    ].join('|');
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(n);
@@ -535,7 +992,21 @@ async function collectTokenNodes(kv, tokenRecord) {
 const PROXY_GROUP_MAIN = '🚀 节点选择';
 const PROXY_GROUP_AUTO = '♻️ 自动选择';
 
-function buildClashYaml(nodes, tokenRecord) {
+function ruleProvider(name) {
+  return {
+    type: 'http',
+    behavior: 'classical',
+    url: `https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/${name}.list`,
+    path: `./ruleset/${name}.yaml`,
+    interval: 86400,
+  };
+}
+
+function buildClashYaml(allNodes, tokenRecord) {
+  // Clash 无法表示 naive / juicity，跳过
+  const nodes = allNodes.filter((n) => !CLASH_UNSUPPORTED.has(n.protocol));
+  const skipped = allNodes.length - nodes.length;
+
   const usedNames = new Set();
   nodes.forEach((n) => {
     n.name = uniqueName(n.name || n.server, usedNames);
@@ -570,71 +1041,16 @@ function buildClashYaml(nodes, tokenRecord) {
         tolerance: 50,
       },
     ],
-    // 防 DNS 泄漏规则集（参考 ACL4SSR nodnsleak.ini 的 [custom] 规则）
     'rule-providers': {
-      GoogleCNProxyIP: {
-        type: 'http',
-        behavior: 'classical',
-        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/GoogleCNProxyIP.list',
-        path: './ruleset/GoogleCNProxyIP.yaml',
-        interval: 86400,
-      },
-      LocalAreaNetwork: {
-        type: 'http',
-        behavior: 'classical',
-        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/LocalAreaNetwork.list',
-        path: './ruleset/LocalAreaNetwork.yaml',
-        interval: 86400,
-      },
-      UnBan: {
-        type: 'http',
-        behavior: 'classical',
-        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/UnBan.list',
-        path: './ruleset/UnBan.yaml',
-        interval: 86400,
-      },
-      ChinaDomain: {
-        type: 'http',
-        behavior: 'classical',
-        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaDomain.list',
-        path: './ruleset/ChinaDomain.yaml',
-        interval: 86400,
-      },
-      ChinaMedia: {
-        type: 'http',
-        behavior: 'classical',
-        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaMedia.list',
-        path: './ruleset/ChinaMedia.yaml',
-        interval: 86400,
-      },
-      BanAD: {
-        type: 'http',
-        behavior: 'classical',
-        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/BanAD.list',
-        path: './ruleset/BanAD.yaml',
-        interval: 86400,
-      },
-      BanProgramAD: {
-        type: 'http',
-        behavior: 'classical',
-        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/BanProgramAD.list',
-        path: './ruleset/BanProgramAD.yaml',
-        interval: 86400,
-      },
-      ChinaCompanyIp: {
-        type: 'http',
-        behavior: 'classical',
-        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaCompanyIp.list',
-        path: './ruleset/ChinaCompanyIp.yaml',
-        interval: 86400,
-      },
-      ChinaIp: {
-        type: 'http',
-        behavior: 'classical',
-        url: 'https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/ChinaIp.list',
-        path: './ruleset/ChinaIp.yaml',
-        interval: 86400,
-      },
+      GoogleCNProxyIP: ruleProvider('GoogleCNProxyIP'),
+      LocalAreaNetwork: ruleProvider('LocalAreaNetwork'),
+      UnBan: ruleProvider('UnBan'),
+      ChinaDomain: ruleProvider('ChinaDomain'),
+      ChinaMedia: ruleProvider('ChinaMedia'),
+      BanAD: ruleProvider('BanAD'),
+      BanProgramAD: ruleProvider('BanProgramAD'),
+      ChinaCompanyIp: ruleProvider('ChinaCompanyIp'),
+      ChinaIp: ruleProvider('ChinaIp'),
     },
     rules: [
       `DOMAIN-SUFFIX,xn--ngstr-lra8j.com,${PROXY_GROUP_MAIN}`,
@@ -653,8 +1069,10 @@ function buildClashYaml(nodes, tokenRecord) {
     ],
   };
 
+  const safeName = String(tokenRecord.name || '').replace(/[\r\n]/g, ' ');
   let yaml = '# 聚合订阅 - 自动生成\n';
-  yaml += `# 名称: ${tokenRecord.name || ''}\n`;
+  yaml += `# 名称: ${safeName}\n`;
+  if (skipped) yaml += `# 已跳过 ${skipped} 个 Clash 不支持的节点(naive/juicity)\n`;
   yaml += yamlDump(config, 0);
   return yaml;
 }
@@ -665,6 +1083,7 @@ function buildRawSubscription(nodes) {
 }
 
 function subUserInfoHeader(meta) {
+  meta = meta || {};
   const upload = meta.upload || 0;
   const download = meta.download || 0;
   const total = meta.total || 0;
@@ -716,8 +1135,8 @@ async function handleApi(req, env, url) {
   }
   if (path === '/api/nodes' && method === 'POST') {
     const body = await req.json().catch(() => ({}));
-    const text = String(body.raw || '');
-    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const lines = extractNodeLinks(body.raw);
+    if (!lines.length) return jsonResponse({ ok: false, error: '未识别到有效的节点链接' }, 400);
     const nodes = await getNodes(kv);
     const added = [];
     const failed = [];
@@ -757,15 +1176,19 @@ async function handleApi(req, env, url) {
       const idx = nodes.findIndex((n) => n.id === id);
       if (idx < 0) return jsonResponse({ ok: false, error: '节点不存在' }, 404);
 
-      // 支持二次修改节点链接本身（raw），重新解析并刷新 protocol/server/port/name
+      // 二次修改节点链接本身（raw），重新解析并刷新 protocol/server/port/name
       if (typeof body.raw === 'string' && body.raw.trim()) {
+        const links = extractNodeLinks(body.raw);
+        if (links.length !== 1) {
+          return jsonResponse({ ok: false, error: '编辑时需要且只能包含一条有效的节点链接' }, 400);
+        }
         let parsed;
         try {
-          parsed = parseNodeUri(body.raw.trim());
+          parsed = parseNodeUri(links[0]);
         } catch (e) {
           return jsonResponse({ ok: false, error: '节点链接解析失败: ' + e.message }, 400);
         }
-        nodes[idx].raw = body.raw.trim();
+        nodes[idx].raw = links[0];
         nodes[idx].protocol = parsed.protocol;
         nodes[idx].server = parsed.server;
         nodes[idx].port = parsed.port;
@@ -1036,7 +1459,7 @@ const PORTAL_HTML = `<!DOCTYPE html>
     </div>
     <table><thead><tr><th></th><th>名称</th><th>协议</th><th>地址</th><th>状态</th><th></th></tr></thead>
       <tbody id="nodeTbody"></tbody></table>
-    <div class="empty" id="nodeEmpty" style="display:none;">暂无节点，点击上方"添加节点"粘贴 vless / vmess / trojan / ss / hysteria2 链接</div>
+    <div class="empty" id="nodeEmpty" style="display:none;">暂无节点，点击上方"添加节点"粘贴 vless / vmess / trojan / ss / ssr / hysteria / hysteria2 / tuic / anytls / wireguard / masque / mieru / socks5 / naive / juicity 链接</div>
   </section>
 
   <!-- 订阅源面板 -->
@@ -1071,11 +1494,11 @@ const state = { nodes: [], sources: [], tokens: [] };
 function toast(msg){
   const t = document.getElementById('toast');
   t.textContent = msg; t.classList.add('show');
-  setTimeout(()=>t.classList.remove('show'), 1800);
+  setTimeout(()=>t.classList.remove('show'), 2400);
 }
 async function api(path, opts){
   const res = await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
-  if(res.status === 401){ location.href = '/login'; throw new Error('未登录'); }
+  if(res.status === 401 && path !== '/api/login'){ location.href = '/login'; throw new Error('未登录'); }
   return res.json();
 }
 
@@ -1115,7 +1538,7 @@ function renderNodes(){
     <tr>
       <td><span class="dot \${n.enabled!==false?'on':'off'}"></span></td>
       <td>\${escapeHtml(n.name)}</td>
-      <td><span class="tag">\${n.protocol}</span></td>
+      <td><span class="tag">\${escapeHtml(n.protocol)}</span></td>
       <td class="mono">\${escapeHtml(n.server)}:\${n.port}</td>
       <td><span class="tag \${n.enabled!==false?'on':''}">\${n.enabled!==false?'启用':'停用'}</span></td>
       <td class="row-actions">
@@ -1138,8 +1561,8 @@ document.getElementById('addNodeBtn').addEventListener('click', ()=>{
   openModal(\`
     <h3>添加节点</h3>
     <div class="field">
-      <label>节点链接（每行一条，支持 vless / vmess / trojan / ss / hysteria2）</label>
-      <textarea id="nodeRaw" placeholder="vless://...\\ntrojan://...\\nvmess://..."></textarea>
+      <label>节点链接（支持换行 / 空格分隔，或直接粘贴整段 Base64 订阅；支持 vless / vmess / trojan / ss / ssr / hysteria / hysteria2 / tuic / anytls / wireguard / masque / mieru / socks5 / naive / juicity）</label>
+      <textarea id="nodeRaw" placeholder="vless://...&#10;trojan://...&#10;masque://..."></textarea>
     </div>
     <div class="modal-actions">
       <button class="ghost" onclick="closeModal()">取消</button>
@@ -1151,10 +1574,11 @@ async function submitNode(){
   const raw = document.getElementById('nodeRaw').value.trim();
   if(!raw) return;
   const r = await api('/api/nodes', {method:'POST', body: JSON.stringify({raw})});
+  if(r.ok === false){ toast(r.error || '添加失败'); return; }
   closeModal();
   loadNodes();
   if(r.failed && r.failed.length){
-    toast(\`成功 \${r.added.length} 条，失败 \${r.failed.length} 条\`);
+    toast(\`成功 \${r.added.length} 条，失败 \${r.failed.length} 条：\${r.failed[0].error}\`);
   } else {
     toast(\`成功添加 \${r.added.length} 个节点\`);
   }
@@ -1167,7 +1591,7 @@ function editNode(id){
   openModal(\`
     <h3>编辑节点</h3>
     <div class="field">
-      <label>节点链接</label>
+      <label>节点链接（仅限一条）</label>
       <textarea id="editNodeRaw" style="min-height:80px;">\${escapeHtml(n.raw)}</textarea>
     </div>
     <div class="field">
@@ -1294,7 +1718,7 @@ async function deleteToken(token){
 
 function nodeChecklistHtml(selectedIds){
   if(!state.nodes.length) return '<div class="mono">暂无节点</div>';
-  return state.nodes.map(n=>\`<label><input type="checkbox" value="\${n.id}" \${selectedIds.includes(n.id)?'checked':''}> \${escapeHtml(n.name)} <span class="mono">(\${n.protocol})</span></label>\`).join('');
+  return state.nodes.map(n=>\`<label><input type="checkbox" value="\${n.id}" \${selectedIds.includes(n.id)?'checked':''}> \${escapeHtml(n.name)} <span class="mono">(\${escapeHtml(n.protocol)})</span></label>\`).join('');
 }
 function sourceChecklistHtml(selectedIds){
   if(!state.sources.length) return '<div class="mono">暂无订阅源</div>';
@@ -1408,6 +1832,7 @@ export default {
 // 导出内部函数供本地测试使用（Cloudflare Workers 环境下 export 不影响运行）
 export const __testables__ = {
   parseNodeUri,
+  extractNodeLinks,
   buildClashYaml,
   buildRawSubscription,
   yamlDump,
